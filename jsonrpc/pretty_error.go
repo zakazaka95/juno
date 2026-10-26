@@ -266,7 +266,9 @@ func prettyParseError(c *windowBuffer, err error) string {
 
 	markerPos := absOffset - windowStart
 	line, relativeCol, absoluteCol := lineAndColumn(c, markerPos)
-	msg := fmt.Sprintf("%s [line %d, position %d]", describeError(c.window, markerPos, err), line, absoluteCol)
+	msg := fmt.Sprintf(
+		"%s [line %d, position %d]", describeError(c.window, markerPos, err), line, absoluteCol,
+	)
 
 	return drawMarker(c.window, windowStart, markerPos, relativeCol, msg)
 }
