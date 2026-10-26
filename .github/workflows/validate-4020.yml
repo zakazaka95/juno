@@ -1,0 +1,111 @@
+name: Validate Juno 4020 review follow-up
+
+on:
+  push:
+    branches: [validation/juno-4020-review-2026-10-27]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jsonrpc:
+    if: github.repository == 'zakazaka95/juno'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CGO_ENABLED: "1"
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - name: Install native dependencies from repository CI
+        run: sudo apt-get update -qq && sudo apt-get install -y libjemalloc-dev libjemalloc2 libbz2-dev
+      - name: Confirm focused native dependency closure
+        run: go list -deps -test -f '{{if .CgoFiles}}{{.ImportPath}} {{.CgoFiles}}{{end}}' ./jsonrpc
+      - name: Full JSON-RPC package tests
+        shell: bash
+        run: |
+          go test -json ./jsonrpc -count=1 -timeout=5m | tee "$RUNNER_TEMP/juno-jsonrpc.jsonl"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          rows = [json.loads(line) for line in (Path(os.environ["RUNNER_TEMP"]) / "juno-jsonrpc.jsonl").read_text().splitlines()]
+          passed = [row["Test"] for row in rows if row.get("Action") == "pass" and row.get("Test")]
+          failed = [row["Test"] for row in rows if row.get("Action") == "fail" and row.get("Test")]
+          skipped = [row["Test"] for row in rows if row.get("Action") == "skip" and row.get("Test")]
+          print(f"JSON-RPC test events: {len(passed)} passed, {len(failed)} failed, {len(skipped)} skipped")
+          assert passed and not failed
+          PY
+      - name: Vet JSON-RPC package
+        run: go vet ./jsonrpc
+      - name: Literal-output negative controls
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          path = Path("jsonrpc/pretty_error.go")
+          original = path.read_text()
+          controls = [
+              ("absolute column", [("absoluteCol += c.linePrefixRunes", "absoluteCol += 0")]),
+              ("caret column", [
+                  ("line, relativeCol, absoluteCol := lineAndColumn(c, markerPos)", "line, _, absoluteCol := lineAndColumn(c, markerPos)"),
+                  ("return drawMarker(c.window, windowStart, markerPos, relativeCol, msg)", "return drawMarker(c.window, windowStart, markerPos, absoluteCol, msg)"),
+              ]),
+          ]
+          try:
+              for name, replacements in controls:
+                  mutated = original
+                  for before, after in replacements:
+                      assert mutated.count(before) == 1, before
+                      mutated = mutated.replace(before, after)
+                  path.write_text(mutated)
+                  result = subprocess.run(
+                      ["go", "test", "-json", "./jsonrpc", "-run", "^TestHandleParseErrorChunked$", "-count=1", "-timeout=90s"],
+                      capture_output=True, text=True, timeout=120,
+                  )
+                  events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+                  failures = [
+                      event["Test"] for event in events
+                      if event.get("Action") == "fail" and event.get("Test", "").startswith("TestHandleParseErrorChunked/")
+                  ]
+                  print(f"{name}: returncode={result.returncode}, assertion failures={failures}")
+                  assert result.returncode != 0 and len(failures) == 3, result.stdout + result.stderr
+                  assert "[build failed]" not in result.stdout + result.stderr
+                  path.write_text(original)
+          finally:
+              path.write_text(original)
+          PY
+          go test ./jsonrpc -run '^TestHandleParseErrorChunked$' -count=1 -timeout=90s
+          git diff --exit-code
+      - name: Check Go formatting
+        shell: bash
+        run: |
+          go install mvdan.cc/gofumpt@latest
+          test -z "$(gofmt -l jsonrpc/pretty_error.go jsonrpc/pretty_error_test.go)"
+          test -z "$(gofumpt -l jsonrpc/pretty_error.go jsonrpc/pretty_error_test.go)"
+      - name: Full repository lint configuration on JSON-RPC
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a
+        with:
+          version: latest
+          args: --verbose ./jsonrpc/...
+      - name: Strict changed-line repository lint configuration
+        if: always()
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a
+        with:
+          version: latest
+          args: --config=./.golangci_diff.yaml --new-from-rev=b87a330ddd8b9b7b5ac82a0c0722367a622663f1 ./jsonrpc/...
+      - name: Confirm source and dependency files restored
+        if: always()
+        run: git diff --exit-code
