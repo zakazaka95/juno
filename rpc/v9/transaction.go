@@ -3,7 +3,9 @@ package rpcv9
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
+	jsonv1 "encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,11 +18,11 @@ import (
 	"github.com/NethermindEth/juno/core/felt"
 	"github.com/NethermindEth/juno/db"
 	"github.com/NethermindEth/juno/jsonrpc"
-	"github.com/NethermindEth/juno/l1/eth"
 	"github.com/NethermindEth/juno/mempool"
 	"github.com/NethermindEth/juno/rpc/rpccore"
 	"github.com/NethermindEth/juno/starknet"
 	"github.com/NethermindEth/juno/starknet/compiler"
+	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils/compression"
 	"github.com/NethermindEth/juno/utils/throttler"
 	"go.uber.org/zap"
@@ -256,18 +258,17 @@ type ResourceBoundsMap struct {
 	L1DataGas *ResourceBounds `json:"l1_data_gas" validate:"required"`
 }
 
-func (r *ResourceBoundsMap) MarshalJSON() ([]byte, error) {
-	// Check if L1DataGas is nil, if it is, provide default values
-	if r.L1DataGas == nil {
-		r.L1DataGas = &ResourceBounds{
+// MarshalJSONTo writes the bounds with zero L1 data gas when a pre-0.13.4 transaction has none.
+func (r ResourceBoundsMap) MarshalJSONTo(enc *jsontext.Encoder) error {
+	type alias ResourceBoundsMap
+	bounds := alias(r)
+	if bounds.L1DataGas == nil {
+		bounds.L1DataGas = &ResourceBounds{
 			MaxAmount:       &felt.Zero,
 			MaxPricePerUnit: &felt.Zero,
 		}
 	}
-
-	// Define an alias to avoid recursion
-	type alias ResourceBoundsMap
-	return json.Marshal((*alias)(r))
+	return json.MarshalEncode(enc, &bounds)
 }
 
 // https://github.com/starkware-libs/starknet-specs/blob/a789ccc3432c57777beceaa53a34a7ae2f25fda0/api/starknet_api_openrpc.json#L1252
@@ -304,7 +305,7 @@ type TransactionStatus struct {
 
 type MsgToL1 struct {
 	From    *felt.Felt            `json:"from_address,omitempty"`
-	To      eth.Address           `json:"to_address"`
+	To      felt.Felt             `json:"to_address"`
 	Payload felt.Slice[felt.Felt] `json:"payload"`
 }
 
@@ -370,7 +371,7 @@ type AddTxResponse struct {
 // https://github.com/starkware-libs/starknet-specs/blob/a789ccc3432c57777beceaa53a34a7ae2f25fda0/api/starknet_api_openrpc.json#L1273-L1287
 type BroadcastedTransaction struct {
 	Transaction
-	ContractClass json.RawMessage `json:"contract_class,omitempty" validate:"required_if=Transaction.Type DECLARE"`
+	ContractClass jsonv1.RawMessage `json:"contract_class,omitempty" validate:"required_if=Transaction.Type DECLARE"` //nolint:lll // struct tag cannot wrap
 }
 
 func AdaptBroadcastedTransaction(
@@ -542,22 +543,50 @@ func AdaptRPCTxToFeederTx(rpcTx *Transaction) starknet.Transaction {
 // It follows the specification defined here:
 // https://github.com/starkware-libs/starknet-specs/blob/0bf403bfafbfbe0eaa52103a9c7df545bec8f73b/api/starknet_api_openrpc.json#L315
 func (h *Handler) TransactionByHash(hash *felt.Felt) (Transaction, *jsonrpc.Error) {
-	// Check the pre-confirmed chain first.
-	if chain, err := h.syncReader.PreConfirmedChain(); err == nil {
-		if txn, err := chain.TransactionByHash(hash); err == nil {
-			return AdaptTransaction(txn), nil
+	// The stored pre_confirmed chain answers without waiting for a poll.
+	if chain, err := h.syncReader.ReadPreConfirmedChain(); err == nil {
+		if preConfirmedTxn, err := chain.TransactionByHash(hash); err == nil {
+			return AdaptTransaction(preConfirmedTxn), nil
 		}
 	}
 
+	txn, rpcErr := h.finalisedTransactionByHash(hash)
+	if rpcErr == nil {
+		return AdaptTransaction(txn), nil
+	}
+	if rpcErr != rpccore.ErrTxnHashNotFound {
+		return Transaction{}, rpcErr
+	}
+
+	// Not in a finalised block either, so request a fresher pre_confirmed chain.
+	if chain, err := h.syncReader.RequestPreConfirmedChain(); err == nil {
+		if preConfirmedTxn, err := chain.TransactionByHash(hash); err == nil {
+			return AdaptTransaction(preConfirmedTxn), nil
+		}
+	}
+
+	// We need to read the disk again because it could've been updated while we were waiting
+	// for the pre-confirmed data.
+	txn, rpcErr = h.finalisedTransactionByHash(hash)
+	if rpcErr != nil {
+		return Transaction{}, rpcErr
+	}
+	return AdaptTransaction(txn), nil
+}
+
+// finalisedTransactionByHash looks a transaction up in the finalised blocks.
+// Returns rpccore.ErrTxnHashNotFound if it is not there.
+func (h *Handler) finalisedTransactionByHash(
+	hash *felt.Felt,
+) (core.Transaction, *jsonrpc.Error) {
 	txn, err := h.bcReader.TransactionByHash(hash)
 	if err != nil {
 		if !errors.Is(err, db.ErrKeyNotFound) {
-			return Transaction{}, rpccore.ErrInternal.CloneWithData(err)
+			return nil, rpccore.ErrInternal.CloneWithData(err)
 		}
-		return Transaction{}, rpccore.ErrTxnHashNotFound
+		return nil, rpccore.ErrTxnHashNotFound
 	}
-
-	return AdaptTransaction(txn), nil
+	return txn, nil
 }
 
 // TransactionByBlockIDAndIndex returns the details of a transaction identified by the given
@@ -576,7 +605,7 @@ func (h *Handler) TransactionByBlockIDAndIndex(
 	var err error
 	switch blockID.Type() {
 	case preConfirmed:
-		chain, err := h.syncReader.PreConfirmedChain()
+		chain, err := h.syncReader.RequestPreConfirmedChain()
 		if err != nil {
 			return Transaction{}, rpccore.ErrBlockNotFound
 		}
@@ -614,24 +643,20 @@ func (h *Handler) TransactionByBlockIDAndIndex(
 	return AdaptTransaction(txn), nil
 }
 
-// getPendingTransactionReceipt searches for a transaction receipt in the pre-confirmed block.
-// Returns the receipt if found, otherwise returns `rpccore.ErrTxnHashNotFound`.
-func (h *Handler) getPendingTransactionReceipt(
+// preConfirmedTransactionReceipt searches for a transaction receipt in the pre_confirmed chain.
+// Reports whether the chain holds the transaction.
+func preConfirmedTransactionReceipt(
+	chain *preconfirmed.ChainReader,
 	hash *felt.Felt,
-) (TransactionReceiptWithBlockInfo, *jsonrpc.Error) {
-	chain, err := h.syncReader.PreConfirmedChain()
-	if err != nil {
-		return TransactionReceiptWithBlockInfo{}, rpccore.ErrTxnHashNotFound
-	}
-
+) (TransactionReceiptWithBlockInfo, bool) {
 	receipt, blockNumber, err := chain.ReceiptByHash(hash)
 	if err != nil {
-		return TransactionReceiptWithBlockInfo{}, rpccore.ErrTxnHashNotFound
+		return TransactionReceiptWithBlockInfo{}, false
 	}
 
 	txn, err := chain.TransactionByHash(hash)
 	if err != nil {
-		return TransactionReceiptWithBlockInfo{}, rpccore.ErrTxnHashNotFound
+		return TransactionReceiptWithBlockInfo{}, false
 	}
 
 	return AdaptReceiptWithBlockInfo(
@@ -640,7 +665,7 @@ func (h *Handler) getPendingTransactionReceipt(
 		TxnPreConfirmed,
 		nil,
 		blockNumber,
-	), nil
+	), true
 }
 
 // TransactionReceiptByHash returns the receipt of a transaction identified by the given hash.
@@ -650,11 +675,35 @@ func (h *Handler) getPendingTransactionReceipt(
 func (h *Handler) TransactionReceiptByHash(
 	hash *felt.Felt,
 ) (TransactionReceiptWithBlockInfo, *jsonrpc.Error) {
-	adaptedReceipt, rpcErr := h.getPendingTransactionReceipt(hash)
-	if rpcErr == nil {
-		return adaptedReceipt, nil
+	// The stored pre_confirmed chain answers without waiting for a poll.
+	if chain, err := h.syncReader.ReadPreConfirmedChain(); err == nil {
+		if adaptedReceipt, found := preConfirmedTransactionReceipt(&chain, hash); found {
+			return adaptedReceipt, nil
+		}
 	}
 
+	adaptedReceipt, rpcErr := h.getFinalisedTransactionReceipt(hash)
+	if rpcErr != rpccore.ErrTxnHashNotFound {
+		return adaptedReceipt, rpcErr
+	}
+
+	// Not in a finalised block either, so request a fresher pre_confirmed chain.
+	if chain, err := h.syncReader.RequestPreConfirmedChain(); err == nil {
+		if adaptedReceipt, found := preConfirmedTransactionReceipt(&chain, hash); found {
+			return adaptedReceipt, nil
+		}
+	}
+
+	// We need to read the disk again because it could've been updated while we were waiting
+	// for the pre-confirmed data.
+	return h.getFinalisedTransactionReceipt(hash)
+}
+
+// getFinalisedTransactionReceipt searches for a transaction receipt in the finalised blocks.
+// Returns rpccore.ErrTxnHashNotFound if the transaction is not in a finalised block.
+func (h *Handler) getFinalisedTransactionReceipt(
+	hash *felt.Felt,
+) (TransactionReceiptWithBlockInfo, *jsonrpc.Error) {
 	blockNumber, idx, err := h.bcReader.BlockNumberAndIndexByTxHash((*felt.TransactionHash)(hash))
 	if err != nil {
 		if !errors.Is(err, db.ErrKeyNotFound) {
@@ -772,7 +821,7 @@ func (h *Handler) pushToFeederGateway(
 
 	if tx.Type == TxnDeclare && tx.Version.Cmp(felt.NewFromUint64[felt.Felt](2)) != -1 {
 		contractClass := make(map[string]any)
-		if err := json.Unmarshal(tx.ContractClass, &contractClass); err != nil {
+		if err := jsonv1.Unmarshal(tx.ContractClass, &contractClass); err != nil {
 			return AddTxResponse{}, rpccore.ErrInternal.CloneWithData(fmt.Sprintf("unmarshal contract class: %v", err))
 		}
 		sierraProg, ok := contractClass["sierra_program"]
@@ -780,7 +829,7 @@ func (h *Handler) pushToFeederGateway(
 			return AddTxResponse{}, jsonrpc.Err(jsonrpc.InvalidParams, "{'sierra_program': ['Missing data for required field.']}")
 		}
 
-		sierraProgBytes, errIn := json.Marshal(sierraProg)
+		sierraProgBytes, errIn := jsonv1.Marshal(sierraProg)
 		if errIn != nil {
 			return AddTxResponse{}, jsonrpc.Err(jsonrpc.InternalError, errIn.Error())
 		}
@@ -791,7 +840,7 @@ func (h *Handler) pushToFeederGateway(
 		}
 
 		contractClass["sierra_program"] = gwSierraProg
-		newContractClass, err := json.Marshal(contractClass)
+		newContractClass, err := jsonv1.Marshal(contractClass)
 		if err != nil {
 			return AddTxResponse{}, rpccore.ErrInternal.CloneWithData(fmt.Sprintf("marshal revised contract class: %v", err))
 		}
@@ -799,7 +848,7 @@ func (h *Handler) pushToFeederGateway(
 	}
 
 	payload := AdaptRPCTxToAddTxGatewayPayload(tx)
-	txJSON, err := json.Marshal(&payload)
+	txJSON, err := jsonv1.Marshal(&payload)
 	if err != nil {
 		return AddTxResponse{}, rpccore.ErrInternal.CloneWithData(fmt.Sprintf("marshal transaction: %v", err))
 	}
@@ -818,7 +867,7 @@ func (h *Handler) pushToFeederGateway(
 		ContractAddress *felt.Felt `json:"address"`
 		ClassHash       *felt.Felt `json:"class_hash"`
 	}
-	if err = json.Unmarshal(respJSON, &gatewayResponse); err != nil {
+	if err = jsonv1.Unmarshal(respJSON, &gatewayResponse); err != nil {
 		return AddTxResponse{}, jsonrpc.Err(jsonrpc.InternalError, fmt.Sprintf("unmarshal gateway response: %v", err))
 	}
 
@@ -831,7 +880,7 @@ func (h *Handler) pushToFeederGateway(
 
 type AddTxGatewayPayload struct {
 	starknet.Transaction
-	ContractClass json.RawMessage `json:"contract_class,omitempty"`
+	ContractClass jsonv1.RawMessage `json:"contract_class,omitempty"`
 }
 
 func AdaptRPCTxToAddTxGatewayPayload(rpcTx *BroadcastedTransaction) AddTxGatewayPayload {
@@ -880,13 +929,14 @@ func (h *Handler) TransactionStatus(
 }
 
 // transactionStatusFromStore resolves a transaction's status from the
-// pre_confirmed chain or the committed store, decoding only the receipt fields
+// committed store or the pre_confirmed chain, decoding only the receipt fields
 // the status needs instead of adapting the whole receipt. Returns
 // rpccore.ErrTxnHashNotFound if the transaction is not found locally.
 func (h *Handler) transactionStatusFromStore(
 	hash *felt.Felt,
 ) (TransactionStatus, *jsonrpc.Error) {
-	if chain, err := h.syncReader.PreConfirmedChain(); err == nil {
+	// The stored pre_confirmed chain answers without waiting for a poll.
+	if chain, err := h.syncReader.ReadPreConfirmedChain(); err == nil {
 		if receipt, _, err := chain.ReceiptByHash(hash); err == nil {
 			return newTransactionStatus(
 				TxnStatusPreConfirmed, receipt.Reverted, receipt.RevertReason,
@@ -894,6 +944,31 @@ func (h *Handler) transactionStatusFromStore(
 		}
 	}
 
+	status, rpcErr := h.finalisedTransactionStatus(hash)
+	if rpcErr != rpccore.ErrTxnHashNotFound {
+		return status, rpcErr
+	}
+
+	// Not in a finalised block either, so request a fresher pre_confirmed chain.
+	if chain, err := h.syncReader.RequestPreConfirmedChain(); err == nil {
+		if receipt, _, err := chain.ReceiptByHash(hash); err == nil {
+			return newTransactionStatus(
+				TxnStatusPreConfirmed, receipt.Reverted, receipt.RevertReason,
+			), nil
+		}
+	}
+
+	// We need to read the disk again because it could've been updated while we were waiting
+	// for the pre-confirmed data.
+	return h.finalisedTransactionStatus(hash)
+}
+
+// finalisedTransactionStatus resolves a transaction's status from the committed
+// store. Returns rpccore.ErrTxnHashNotFound if the transaction is not in a
+// finalised block.
+func (h *Handler) finalisedTransactionStatus(
+	hash *felt.Felt,
+) (TransactionStatus, *jsonrpc.Error) {
 	blockNumber, index, err := h.bcReader.BlockNumberAndIndexByTxHash(
 		(*felt.TransactionHash)(hash),
 	)
@@ -1065,7 +1140,7 @@ func AdaptReceipt(
 	messages := make([]MsgToL1, len(receipt.L2ToL1Message))
 	for idx, msg := range receipt.L2ToL1Message {
 		messages[idx] = MsgToL1{
-			To:      msg.To,
+			To:      felt.FromBytes[felt.Felt](msg.To.Bytes()),
 			Payload: msg.Payload,
 			From:    msg.From,
 		}

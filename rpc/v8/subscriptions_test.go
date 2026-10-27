@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder/adaptfeedertest"
 	"github.com/NethermindEth/juno/blockchain"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
@@ -25,11 +26,11 @@ import (
 	"github.com/NethermindEth/juno/jsonrpc"
 	"github.com/NethermindEth/juno/mocks"
 	"github.com/NethermindEth/juno/rpc/rpccore"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/NethermindEth/juno/sync"
 	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/coder/websocket"
+	"github.com/sourcegraph/conc/pool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -130,13 +131,10 @@ func TestSubscribeEvents(t *testing.T) {
 
 	n := &networks.Sepolia
 	client := feeder.NewTestClient(t, n)
-	gw := adaptfeeder.New(client)
 
-	b1, err := gw.BlockByNumber(t.Context(), 56377)
-	require.NoError(t, err)
-
-	b2, err := gw.BlockByNumber(t.Context(), 56378)
-	require.NoError(t, err)
+	b1 := adaptfeedertest.Block(t, client, 56377)
+	b2 := adaptfeedertest.Block(t, client, 56378)
+	b2WithBloom := newBlockWithBloom(b2)
 
 	fromAddr := felt.NewFromBytes[felt.Address]([]byte("some address"))
 	keys := [][]felt.Felt{{felt.FromBytes[felt.Felt]([]byte("key1"))}}
@@ -170,7 +168,7 @@ func TestSubscribeEvents(t *testing.T) {
 
 		mockEventFilterer.EXPECT().Events(gomock.Any(), gomock.Any()).
 			Return(b2Filtered, blockchain.ContinuationToken{}, nil)
-		handler.newHeads.Send(b2)
+		handler.newHeads.Send(b2WithBloom)
 		assertNextEvents(t, clientConn, id, b2Emitted)
 	})
 
@@ -262,18 +260,18 @@ func TestSubscribeEvents(t *testing.T) {
 		// because it only handled the deprecated pending.Pending variant.
 		pending1 := createTestPendingBlock(t, b2, 3)
 		preConfirmed1 := pendingpkg.NewPreConfirmed(pending1, nil, nil, "")
-		handler.preConfirmedFeed.Send(&preConfirmed1)
+		handler.preConfirmedFeed.Send(newPreConfirmedWithBloom(&preConfirmed1))
 		assertNoMessage(t, clientConn)
 
 		pending2 := createTestPendingBlock(t, b2, 6)
 		preConfirmed2 := pendingpkg.NewPreConfirmed(pending2, nil, nil, "")
-		handler.preConfirmedFeed.Send(&preConfirmed2)
+		handler.preConfirmedFeed.Send(newPreConfirmedWithBloom(&preConfirmed2))
 		assertNoMessage(t, clientConn)
 
 		// Since no pending events were tracked, all b2 events are sent (no deduplication).
 		mockEventFilterer.EXPECT().Events(gomock.Any(), gomock.Any()).
 			Return(b2Filtered, blockchain.ContinuationToken{}, nil)
-		handler.newHeads.Send(b2)
+		handler.newHeads.Send(b2WithBloom)
 		assertNextEvents(t, clientConn, id, b2Emitted)
 	})
 }
@@ -300,7 +298,7 @@ func TestSubscribeTxnStatus(t *testing.T) {
 			(*felt.TransactionHash)(txHash),
 		).Return(uint64(0), uint64(0), db.ErrKeyNotFound).AnyTimes()
 		mockSyncer.EXPECT().
-			PreConfirmedChain().
+			RequestPreConfirmedChain().
 			Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound).
 			AnyTimes()
 		mockChain.EXPECT().HeadsHeader().Return(nil, db.ErrKeyNotFound).AnyTimes()
@@ -323,7 +321,7 @@ func TestSubscribeTxnStatus(t *testing.T) {
 		handler := New(mockChain, mockSyncer, nil, logger)
 		handler.WithFeeder(feeder.NewTestClient(t, &networks.SepoliaIntegration))
 		mockSyncer.EXPECT().
-			PreConfirmedChain().
+			RequestPreConfirmedChain().
 			Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound).
 			AnyTimes()
 		mockChain.EXPECT().HeadsHeader().Return(nil, db.ErrKeyNotFound).AnyTimes()
@@ -374,14 +372,12 @@ func TestSubscribeTxnStatus(t *testing.T) {
 		t.Cleanup(mockCtrl.Finish)
 
 		client := feeder.NewTestClient(t, &networks.SepoliaIntegration)
-		gw := adaptfeeder.New(client)
 		mockChain := mocks.NewMockReader(mockCtrl)
 		mockSyncer := mocks.NewMockSyncReader(mockCtrl)
 		handler := New(mockChain, mockSyncer, nil, logger)
 		handler.WithFeeder(client)
 
-		block, err := gw.BlockByNumber(t.Context(), 38748)
-		require.NoError(t, err)
+		block := adaptfeedertest.Block(t, client, 38748)
 
 		txHash, err := new(felt.Felt).SetString("0x1001")
 		require.NoError(t, err)
@@ -406,12 +402,18 @@ func TestSubscribeTxnStatus(t *testing.T) {
 		mockChain.EXPECT().L1Head().Return(core.L1Head{}, db.ErrKeyNotFound)
 		for i := range 3 {
 			handler.preConfirmedFeed.Send(
-				&pendingpkg.PreConfirmed{Block: &core.Block{Header: &core.Header{}}},
+				newPreConfirmedWithBloom(
+					&pendingpkg.PreConfirmed{Block: &core.Block{Header: &core.Header{}}},
+				),
 			)
 			handler.preConfirmedFeed.Send(
-				&pendingpkg.PreConfirmed{Block: &core.Block{Header: &core.Header{}}},
+				newPreConfirmedWithBloom(
+					&pendingpkg.PreConfirmed{Block: &core.Block{Header: &core.Header{}}},
+				),
 			)
-			handler.newHeads.Send(&core.Block{Header: &core.Header{Number: block.Number + 1 + uint64(i)}})
+			handler.newHeads.Send(newBlockWithBloom(
+				&core.Block{Header: &core.Header{Number: block.Number + 1 + uint64(i)}},
+			))
 		}
 		assertNextTxnStatus(t, conn, id, txHash, TxnStatusAcceptedOnL2, TxnSuccess, "")
 
@@ -433,16 +435,16 @@ func TestSubscribeTxnStatus(t *testing.T) {
 }
 
 type fakeSyncer struct {
-	newHeads     *feed.Feed[*core.Block]
+	newHeads     *feed.Feed[*core.WithBloom[*core.Block]]
 	reorgs       *feed.Feed[*sync.ReorgBlockRange]
-	preConfirmed *feed.Feed[*pendingpkg.PreConfirmed]
+	preConfirmed *feed.Feed[*core.WithBloom[*pendingpkg.PreConfirmed]]
 }
 
 func newFakeSyncer() *fakeSyncer {
 	return &fakeSyncer{
-		newHeads:     feed.New[*core.Block](),
+		newHeads:     feed.New[*core.WithBloom[*core.Block]](),
 		reorgs:       feed.New[*sync.ReorgBlockRange](),
-		preConfirmed: feed.New[*pendingpkg.PreConfirmed](),
+		preConfirmed: feed.New[*core.WithBloom[*pendingpkg.PreConfirmed]](),
 	}
 }
 
@@ -454,8 +456,8 @@ func (fs *fakeSyncer) SubscribeReorg() sync.ReorgSubscription {
 	return sync.ReorgSubscription{Subscription: fs.reorgs.Subscribe()}
 }
 
-func (fs *fakeSyncer) SubscribePreConfirmed() sync.PreConfirmedDataSubscription {
-	return sync.PreConfirmedDataSubscription{Subscription: fs.preConfirmed.Subscribe()}
+func (fs *fakeSyncer) SubscribePreConfirmed() preconfirmed.Subscription {
+	return preconfirmed.Subscription{Subscription: fs.preConfirmed.Subscribe()}
 }
 
 func (fs *fakeSyncer) StartingBlockHeader() (*core.Header, error) {
@@ -466,7 +468,11 @@ func (fs *fakeSyncer) HighestBlockHeader() *core.Header {
 	return nil
 }
 
-func (fs *fakeSyncer) PreConfirmedChain() (preconfirmed.ChainReader, error) {
+func (fs *fakeSyncer) RequestPreConfirmedChain() (preconfirmed.ChainReader, error) {
+	return preconfirmed.ChainReader{}, pendingpkg.ErrPreConfirmedNotFound
+}
+
+func (fs *fakeSyncer) ReadPreConfirmedChain() (preconfirmed.ChainReader, error) {
 	return preconfirmed.ChainReader{}, pendingpkg.ErrPreConfirmedNotFound
 }
 
@@ -539,7 +545,7 @@ func TestSubscribeNewHeads(t *testing.T) {
 		require.NoError(t, err)
 
 		// Simulate a new block
-		syncer.newHeads.Send(testHeadBlock(t))
+		syncer.newHeads.Send(newBlockWithBloom(testHeadBlock(t)))
 
 		// Receive a block header.
 		_, headerGot, err := conn.Read(ctx)
@@ -550,13 +556,9 @@ func TestSubscribeNewHeads(t *testing.T) {
 
 func TestSubscribeNewHeadsHistorical(t *testing.T) {
 	client := feeder.NewTestClient(t, &networks.Mainnet)
-	gw := adaptfeeder.New(client)
 
-	block0, err := gw.BlockByNumber(t.Context(), 0)
-	require.NoError(t, err)
-
-	stateUpdate0, err := gw.StateUpdate(t.Context(), 0)
-	require.NoError(t, err)
+	block0 := adaptfeedertest.Block(t, client, 0)
+	stateUpdate0 := adaptfeedertest.StateUpdate(t, client, 0)
 
 	testDB := memory.New()
 	chain := blockchain.New(
@@ -564,7 +566,9 @@ func TestSubscribeNewHeadsHistorical(t *testing.T) {
 		&networks.Mainnet,
 		blockchain.WithNewState(statetestutils.UseNewState()),
 	)
-	assert.NoError(t, chain.Store(block0, &emptyCommitments, stateUpdate0, nil))
+	assert.NoError(t, chain.Store(
+		block0, &emptyCommitments, stateUpdate0, nil, core.EventsBloom(block0.Receipts),
+	))
 
 	chain = blockchain.New(
 		testDB,
@@ -595,7 +599,7 @@ func TestSubscribeNewHeadsHistorical(t *testing.T) {
 	require.Equal(t, want, string(block0Got))
 
 	// Simulate a new block
-	syncer.newHeads.Send(testHeadBlock(t))
+	syncer.newHeads.Send(newBlockWithBloom(testHeadBlock(t)))
 
 	// Check new block content
 	_, newBlockGot, err := conn.Read(ctx)
@@ -655,7 +659,7 @@ func TestMultipleSubscribeNewHeadsAndUnsubscribe(t *testing.T) {
 	require.NoError(t, err)
 
 	// Simulate a new block
-	syncer.newHeads.Send(testHeadBlock(t))
+	syncer.newHeads.Send(newBlockWithBloom(testHeadBlock(t)))
 
 	// Receive a block header.
 	_, firstHeaderGot, err := conn1.Read(ctx)
@@ -791,7 +795,7 @@ func TestSubscribePendingTxs(t *testing.T) {
 		hash4 := new(felt.Felt).SetUint64(4)
 		hash5 := new(felt.Felt).SetUint64(5)
 
-		syncer.preConfirmed.Send(&pendingpkg.PreConfirmed{
+		syncer.preConfirmed.Send(newPreConfirmedWithBloom(&pendingpkg.PreConfirmed{
 			Block: &core.Block{
 				Header: &core.Header{
 					ParentHash: parentHash,
@@ -804,7 +808,7 @@ func TestSubscribePendingTxs(t *testing.T) {
 					&core.L1HandlerTransaction{TransactionHash: hash5},
 				},
 			},
-		})
+		}))
 		// PreConfirmed is not the deprecated Pending variant, so nothing is emitted.
 		assertNoWsMessage(t, ctx, conn)
 	})
@@ -836,7 +840,7 @@ func TestSubscribePendingTxs(t *testing.T) {
 		hash7 := new(felt.Felt).SetUint64(7)
 		addr7 := new(felt.Felt).SetUint64(77)
 
-		syncer.preConfirmed.Send(&pendingpkg.PreConfirmed{
+		syncer.preConfirmed.Send(newPreConfirmedWithBloom(&pendingpkg.PreConfirmed{
 			Block: &core.Block{
 				Header: &core.Header{
 					ParentHash: parentHash,
@@ -851,7 +855,7 @@ func TestSubscribePendingTxs(t *testing.T) {
 					&core.DeclareTransaction{TransactionHash: hash7, SenderAddress: addr7},
 				},
 			},
-		})
+		}))
 		// PreConfirmed is not the deprecated Pending variant, so nothing is emitted.
 		assertNoWsMessage(t, ctx, conn)
 	})
@@ -866,7 +870,7 @@ func TestSubscribePendingTxs(t *testing.T) {
 		require.Equal(t, subResp(id), got)
 
 		parentHash := new(felt.Felt).SetUint64(1)
-		syncer.preConfirmed.Send(&pendingpkg.PreConfirmed{
+		syncer.preConfirmed.Send(newPreConfirmedWithBloom(&pendingpkg.PreConfirmed{
 			Block: &core.Block{
 				Header: &core.Header{
 					ParentHash: parentHash,
@@ -902,7 +906,7 @@ func TestSubscribePendingTxs(t *testing.T) {
 					},
 				},
 			},
-		})
+		}))
 
 		// PreConfirmed is not the deprecated Pending variant, so nothing is emitted.
 		assertNoWsMessage(t, ctx, conn)
@@ -1052,10 +1056,8 @@ func testHeadBlock(t *testing.T) *core.Block {
 
 	n := new(networks.Sepolia)
 	client := feeder.NewTestClient(t, n)
-	gw := adaptfeeder.New(client)
 
-	b1, err := gw.BlockByNumber(t.Context(), 56377)
-	require.NoError(t, err)
+	b1 := adaptfeedertest.Block(t, client, 56377)
 
 	return b1
 }
@@ -1076,7 +1078,7 @@ func setupRPC(t *testing.T, ctx context.Context, chain blockchain.Reader, syncer
 	}()
 	time.Sleep(50 * time.Millisecond)
 
-	server := jsonrpc.NewServer(1, logger)
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), logger)
 	methods, _ := handler.methods()
 	require.NoError(t, server.RegisterMethods(methods...))
 
@@ -1259,4 +1261,16 @@ func createTestWebsocket(t *testing.T, subscribe func(context.Context) (Subscrip
 	})
 
 	return id, clientConn
+}
+
+// newBlockWithBloom wraps a block with its event bloom filter for feed tests.
+func newBlockWithBloom(block *core.Block) *core.WithBloom[*core.Block] {
+	return &core.WithBloom[*core.Block]{Value: block, Bloom: core.EventsBloom(block.Receipts)}
+}
+
+func newPreConfirmedWithBloom(
+	preConfirmed *pendingpkg.PreConfirmed,
+) *core.WithBloom[*pendingpkg.PreConfirmed] {
+	withBloom := pendingpkg.NewPreConfirmedWithBloom(preConfirmed)
+	return &withBloom
 }

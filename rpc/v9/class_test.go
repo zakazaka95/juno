@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
 	"github.com/NethermindEth/juno/core"
@@ -15,7 +16,6 @@ import (
 	"github.com/NethermindEth/juno/mocks"
 	rpccore "github.com/NethermindEth/juno/rpc/rpccore"
 	rpcv9 "github.com/NethermindEth/juno/rpc/v9"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -292,7 +292,7 @@ func TestClassHashAt(t *testing.T) {
 				StateDiff: &stateDiff,
 			},
 		}
-		mockSyncReader.EXPECT().PreConfirmedChain().Return(mustNewChain(t, &preConfirmed), nil)
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().Return(mustNewChain(t, &preConfirmed), nil)
 		mockReader.EXPECT().StateAtBlockNumber(preConfirmed.Block.Number-1).
 			Return(mockState, nopCloser, nil)
 
@@ -320,7 +320,8 @@ func TestClassHashAt(t *testing.T) {
 			Block:       &core.Block{Header: &core.Header{Number: 3}},
 			StateUpdate: &core.StateUpdate{StateDiff: &tipStateDiff},
 		}
-		mockSyncReader.EXPECT().PreConfirmedChain().Return(mustNewChain(t, baseEntry, tipEntry), nil)
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().
+			Return(mustNewChain(t, baseEntry, tipEntry), nil)
 		mockReader.EXPECT().StateAtBlockNumber(uint64(1)).Return(mockState, nopCloser, nil)
 
 		preConfirmedID := blockIDPreConfirmed(t)

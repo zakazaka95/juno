@@ -5,6 +5,8 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder"
+	"github.com/NethermindEth/juno/adapters/adaptfeeder/adaptfeedertest"
 	"github.com/NethermindEth/juno/adapters/consensus2p2p"
 	"github.com/NethermindEth/juno/adapters/core2p2p"
 	"github.com/NethermindEth/juno/blockchain"
@@ -19,7 +21,6 @@ import (
 	statetestutils "github.com/NethermindEth/juno/core/state/testutils"
 	"github.com/NethermindEth/juno/db"
 	"github.com/NethermindEth/juno/starknet"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/starknet-io/starknet-p2p-specs/p2p/proto/common"
 	"github.com/starknet-io/starknet-p2p-specs/p2p/proto/consensus/consensus"
 	"github.com/stretchr/testify/require"
@@ -60,13 +61,10 @@ func LoadBlockDependencies(
 	var err error
 	t.Helper()
 
-	gw := adaptfeeder.New(feeder.NewTestClient(t, network))
+	client := feeder.NewTestClient(t, network)
 
-	headBlock, err = gw.BlockByNumber(t.Context(), uint64(height-1))
-	require.NoError(t, err)
-
-	revealedBlock, err = gw.BlockByNumber(t.Context(), headBlock.Number-builder.BlockHashLag)
-	require.NoError(t, err)
+	headBlock = adaptfeedertest.Block(t, client, uint64(height-1))
+	revealedBlock = adaptfeedertest.Block(t, client, headBlock.Number-builder.BlockHashLag)
 
 	err = database.Update(func(txn db.IndexedBatch) error {
 		require.NoError(t, core.WriteBlockHeaderByNumber(txn, revealedBlock.Header))
@@ -315,7 +313,6 @@ func buildPreState(buildResult *builder.BuildResult, headBlockHeader, revealedBl
 	strippedBlockHeader.GlobalStateRoot = nil
 	strippedBlockHeader.TransactionCount = 0
 	strippedBlockHeader.EventCount = 0
-	strippedBlockHeader.EventsBloom = nil
 	strippedBlockHeader.Signatures = nil
 	return builder.BuildState{
 		PreConfirmed: &pending.PreConfirmed{

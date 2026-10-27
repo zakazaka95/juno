@@ -14,6 +14,7 @@ const sidebars = {
         "configuring",
         "updating",
         "snapshots",
+        "remote-database",
       ],
     },
     {
@@ -43,7 +44,12 @@ const sidebars = {
     },
     "staking-validator",
     "monitoring",
-    "tuning",
+    {
+      type: "category",
+      label: "Tuning",
+      collapsed: true,
+      items: ["tuning", "preconfirmed-polling", "contract-compilation"],
+    },
     "plugins",
     "faq",
   ],

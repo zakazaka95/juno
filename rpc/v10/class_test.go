@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
 	"github.com/NethermindEth/juno/core"
@@ -15,7 +16,6 @@ import (
 	"github.com/NethermindEth/juno/mocks"
 	"github.com/NethermindEth/juno/rpc/rpccore"
 	rpc "github.com/NethermindEth/juno/rpc/v10"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -127,7 +127,8 @@ func TestClassAt(t *testing.T) {
 		return nil
 	}, nil).AnyTimes()
 	mockReader.EXPECT().HeadsHeader().Return(new(core.Header), nil).AnyTimes()
-	handler := rpc.New(mockReader, nil, nil, log.NewNopZapLogger())
+	mockSyncReader := mocks.NewMockSyncReader(mockCtrl)
+	handler := rpc.New(mockReader, mockSyncReader, nil, log.NewNopZapLogger())
 
 	latest := rpc.BlockIDLatest()
 
@@ -189,6 +190,30 @@ func TestClassAt(t *testing.T) {
 		class, rpcErr := handler.ClassAt(&latest, danglingAddress)
 		require.Nil(t, class)
 		assert.Equal(t, rpccore.ErrContractNotFound, rpcErr)
+	})
+
+	t.Run("blockID - pre_confirmed", func(t *testing.T) {
+		preConfirmedContractAddress := felt.NewRandom[felt.Felt]()
+		coreClass, err := integGw.Class(t.Context(), sierraClassHash)
+		require.NoError(t, err)
+
+		stateDiff := core.EmptyStateDiff()
+		stateDiff.DeployedContracts[*preConfirmedContractAddress] = sierraClassHash
+
+		preConfirmed := pending.PreConfirmed{
+			Block:       &core.Block{Header: &core.Header{Number: 2}},
+			StateUpdate: &core.StateUpdate{StateDiff: &stateDiff},
+			NewClasses:  map[felt.Felt]core.ClassDefinition{*sierraClassHash: coreClass},
+		}
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().Return(mustNewChain(t, &preConfirmed), nil)
+		mockReader.EXPECT().StateAtBlockNumber(preConfirmed.Block.Number-1).
+			Return(mockState, nopCloser, nil)
+
+		preConfirmedID := rpc.BlockIDPreConfirmed()
+		class, rpcErr := handler.ClassAt(&preConfirmedID, preConfirmedContractAddress)
+		require.Nil(t, rpcErr)
+		sierraClass := coreClass.(*core.SierraClass)
+		assertEqualSierraClass(t, sierraClass, class)
 	})
 }
 
@@ -292,7 +317,7 @@ func TestClassHashAt(t *testing.T) {
 				StateDiff: &stateDiff,
 			},
 		}
-		mockSyncReader.EXPECT().PreConfirmedChain().Return(mustNewChain(t, &preConfirmed), nil)
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().Return(mustNewChain(t, &preConfirmed), nil)
 		mockReader.EXPECT().StateAtBlockNumber(preConfirmed.Block.Number-1).
 			Return(mockState, nopCloser, nil)
 
@@ -320,7 +345,8 @@ func TestClassHashAt(t *testing.T) {
 			Block:       &core.Block{Header: &core.Header{Number: 3}},
 			StateUpdate: &core.StateUpdate{StateDiff: &tipStateDiff},
 		}
-		mockSyncReader.EXPECT().PreConfirmedChain().Return(mustNewChain(t, baseEntry, tipEntry), nil)
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().
+			Return(mustNewChain(t, baseEntry, tipEntry), nil)
 		mockReader.EXPECT().StateAtBlockNumber(uint64(1)).Return(mockState, nopCloser, nil)
 
 		preConfirmedID := rpc.BlockIDPreConfirmed()

@@ -1,0 +1,324 @@
+package cbor_test
+
+import (
+	"encoding/json"
+	"os"
+	"testing"
+
+	"github.com/NethermindEth/juno/consensus/starknet"
+	"github.com/NethermindEth/juno/core"
+	"github.com/NethermindEth/juno/core/felt"
+	"github.com/NethermindEth/juno/core/trie2/triedb/pathdb"
+	"github.com/NethermindEth/juno/core/trie2/trienode"
+	"github.com/NethermindEth/juno/l1/eth"
+	"github.com/NethermindEth/juno/migration"
+	_ "github.com/NethermindEth/juno/utils/cbor/registry"
+	"github.com/stretchr/testify/require"
+)
+
+const goldenFile = "testdata/golden_bytes.json"
+
+// goldenBytes is each record's hex, keyed by name.
+// It is how the records were written, so it is byte for byte what a database holds.
+func goldenBytes(t *testing.T) map[string]string {
+	t.Helper()
+
+	data, err := os.ReadFile(goldenFile)
+	require.NoError(t, err)
+
+	var vectors map[string]string
+	require.NoError(t, json.Unmarshal(data, &vectors))
+	return vectors
+}
+
+type goldenCase struct {
+	name  string
+	value any
+}
+
+// goldenCases is the record set each codec implementation is checked against.
+func goldenCases() []goldenCase {
+	return []goldenCase{
+		{"DeclareTransaction", core.DeclareTransaction{}},
+		{"DeployTransaction", core.DeployTransaction{}},
+		{"InvokeTransaction", core.InvokeTransaction{}},
+		{"L1HandlerTransaction", core.L1HandlerTransaction{}},
+		{"DeployAccountTransaction", core.DeployAccountTransaction{}},
+		{"DeprecatedCairoClass", core.DeprecatedCairoClass{}},
+		{"SierraClass", core.SierraClass{}},
+		{"DeletedNode", trienode.DeletedNode{}},
+		{"LeafNode", trienode.LeafNode{}},
+		{"NonLeafNode", trienode.NonLeafNode{}},
+		{"JournalNodeSet", pathdb.JournalNodeSet{}},
+		{"DiffJournal", pathdb.DiffJournal{}},
+		{"DiskJournal", pathdb.DiskJournal{}},
+		{"DBJournal", pathdb.DBJournal{}},
+		{"WALProposal", starknet.WALProposal{}},
+		{"WALPrevote", starknet.WALPrevote{}},
+		{"WALPrecommit", starknet.WALPrecommit{}},
+		{"WALTimeout", starknet.WALTimeout{}},
+		{"Header", core.Header{}},
+		{"TransactionReceipt", core.TransactionReceipt{}},
+		{"[][]byte, the p2p shape", [][]byte{{1, 2, 3}, {4, 5}, {}}},
+		{"[]byte, the schema state", []byte{9, 8, 7}},
+		{"[][]byte nil", [][]byte(nil)},
+		{"*felt.Felt, the 37-byte shape", felt.NewFromUint64[felt.Felt](7)},
+		{"felt.Slice, two felts", felt.Slice[felt.Felt]{
+			felt.FromUint64[felt.Felt](7),
+			felt.FromUint64[felt.Felt](8),
+		}},
+		{"felt.Slice nil", felt.Slice[felt.Felt](nil)},
+		{"DeclaredClassDefinition, a Sierra class", populatedDeclaredClassDefinition()},
+		{"Header, populated", populatedHeader()},
+		{"InvokeTransaction, populated", populatedInvokeTransaction()},
+		{"TransactionReceipt, populated", populatedReceipt()},
+		{"StateUpdate, populated", populatedStateUpdate()},
+		{"L1Head", core.L1Head{
+			BlockNumber: 8,
+			BlockHash:   felt.NewFromUint64[felt.Felt](9),
+			StateRoot:   felt.NewFromUint64[felt.Felt](10),
+		}},
+		{"BlockCommitments", core.BlockCommitments{
+			TransactionCommitment: felt.NewFromUint64[felt.Felt](12),
+			EventCommitment:       felt.NewFromUint64[felt.Felt](13),
+			ReceiptCommitment:     felt.NewFromUint64[felt.Felt](14),
+			StateDiffCommitment:   felt.NewFromUint64[felt.Felt](15),
+			StateDiffLength:       16,
+		}},
+		{"BlockTransactionsIndexes", core.BlockTransactionsIndexes{
+			Transactions: []int{0, 2, 6},
+			Receipts:     []int{10, 12, 15},
+		}},
+		{"SchemaMetadata", migration.SchemaMetadata{
+			CurrentVersion:    17,
+			LastTargetVersion: 18,
+		}},
+		{"DeclareTransaction, populated", populatedDeclareTransaction()},
+		{"DeployTransaction, populated", populatedDeployTransaction()},
+		{"L1HandlerTransaction, populated", populatedL1HandlerTransaction()},
+		{"DeployAccountTransaction, populated", populatedDeployAccountTransaction()},
+		{"DeprecatedCairoClass, populated", populatedDeprecatedCairoClass()},
+		{"DiffJournal, populated", pathdb.DiffJournal{
+			Root:       felt.FromUint64[felt.StateRootHash](41),
+			Block:      42,
+			EncNodeset: []byte{43, 44},
+		}},
+		{"DiskJournal, populated", pathdb.DiskJournal{
+			Root:       felt.FromUint64[felt.StateRootHash](45),
+			ID:         46,
+			EncNodeset: []byte{47, 48},
+		}},
+		{"DBJournal, populated", pathdb.DBJournal{
+			Version:   49,
+			EncLayers: []byte{50, 51},
+		}},
+	}
+}
+
+func populatedDeclaredClassDefinition() core.DeclaredClassDefinition {
+	return core.DeclaredClassDefinition{
+		At: 777,
+		Class: &core.SierraClass{
+			Abi:             "some abi",
+			AbiHash:         felt.NewFromUint64[felt.Felt](1),
+			Program:         []felt.Felt{felt.FromUint64[felt.Felt](2), felt.FromUint64[felt.Felt](3)},
+			ProgramHash:     felt.NewFromUint64[felt.Felt](4),
+			SemanticVersion: "0.1.0",
+			EntryPoints: core.SierraEntryPointsByType{
+				Constructor: []core.SierraEntryPoint{{Index: 0, Selector: felt.NewFromUint64[felt.Felt](5)}},
+				External:    []core.SierraEntryPoint{{Index: 1, Selector: felt.NewFromUint64[felt.Felt](6)}},
+				L1Handler:   []core.SierraEntryPoint{{Index: 2, Selector: felt.NewFromUint64[felt.Felt](7)}},
+			},
+		},
+	}
+}
+
+func populatedDeclareTransaction() core.DeclareTransaction {
+	version := core.TransactionVersion(felt.FromUint64[felt.Felt](3))
+	return core.DeclareTransaction{
+		TransactionHash:       felt.NewFromUint64[felt.Felt](1),
+		ClassHash:             felt.NewFromUint64[felt.Felt](2),
+		SenderAddress:         felt.NewFromUint64[felt.Felt](3),
+		MaxFee:                felt.NewFromUint64[felt.Felt](4),
+		TransactionSignature:  felt.Slice[felt.Felt]{felt.FromUint64[felt.Felt](5)},
+		Nonce:                 felt.NewFromUint64[felt.Felt](6),
+		Version:               &version,
+		CompiledClassHash:     felt.NewFromUint64[felt.Felt](7),
+		Tip:                   8,
+		PaymasterData:         felt.Slice[felt.Felt]{felt.FromUint64[felt.Felt](9)},
+		AccountDeploymentData: felt.Slice[felt.Felt]{felt.FromUint64[felt.Felt](10)},
+		NonceDAMode:           core.DAModeL1,
+		FeeDAMode:             core.DAModeL2,
+		ResourceBounds: map[core.Resource]core.ResourceBounds{
+			core.ResourceL1Gas: {MaxAmount: 11, MaxPricePerUnit: felt.NewFromUint64[felt.Felt](12)},
+		},
+	}
+}
+
+func populatedDeployTransaction() core.DeployTransaction {
+	version := core.TransactionVersion(felt.FromUint64[felt.Felt](0))
+	return core.DeployTransaction{
+		TransactionHash:     felt.NewFromUint64[felt.Felt](13),
+		ContractAddressSalt: felt.NewFromUint64[felt.Felt](14),
+		ContractAddress:     felt.NewFromUint64[felt.Felt](15),
+		ClassHash:           felt.NewFromUint64[felt.Felt](16),
+		ConstructorCallData: felt.Slice[felt.Felt]{felt.FromUint64[felt.Felt](17)},
+		Version:             &version,
+	}
+}
+
+func populatedL1HandlerTransaction() core.L1HandlerTransaction {
+	version := core.TransactionVersion(felt.FromUint64[felt.Felt](0))
+	return core.L1HandlerTransaction{
+		TransactionHash:    felt.NewFromUint64[felt.Felt](18),
+		ContractAddress:    felt.NewFromUint64[felt.Felt](19),
+		EntryPointSelector: felt.NewFromUint64[felt.Felt](20),
+		Nonce:              felt.NewFromUint64[felt.Felt](21),
+		CallData:           felt.Slice[felt.Felt]{felt.FromUint64[felt.Felt](22)},
+		Version:            &version,
+	}
+}
+
+func populatedDeployAccountTransaction() core.DeployAccountTransaction {
+	return core.DeployAccountTransaction{
+		DeployTransaction:    populatedDeployTransaction(),
+		MaxFee:               felt.NewFromUint64[felt.Felt](23),
+		TransactionSignature: felt.Slice[felt.Felt]{felt.FromUint64[felt.Felt](24)},
+		Nonce:                felt.NewFromUint64[felt.Felt](25),
+		Tip:                  26,
+		PaymasterData:        felt.Slice[felt.Felt]{felt.FromUint64[felt.Felt](27)},
+		NonceDAMode:          core.DAModeL2,
+		FeeDAMode:            core.DAModeL1,
+		ResourceBounds: map[core.Resource]core.ResourceBounds{
+			core.ResourceL2Gas: {MaxAmount: 28, MaxPricePerUnit: felt.NewFromUint64[felt.Felt](29)},
+		},
+	}
+}
+
+func populatedDeprecatedCairoClass() core.DeprecatedCairoClass {
+	return core.DeprecatedCairoClass{
+		Abi:     json.RawMessage(`{"abi":1}`),
+		Program: "some program",
+		Externals: []core.DeprecatedEntryPoint{
+			{Selector: felt.NewFromUint64[felt.Felt](30), Offset: felt.NewFromUint64[felt.Felt](31)},
+		},
+		L1Handlers: []core.DeprecatedEntryPoint{
+			{Selector: felt.NewFromUint64[felt.Felt](32), Offset: felt.NewFromUint64[felt.Felt](33)},
+		},
+		Constructors: []core.DeprecatedEntryPoint{
+			{Selector: felt.NewFromUint64[felt.Felt](34), Offset: felt.NewFromUint64[felt.Felt](35)},
+		},
+	}
+}
+
+func populatedStateUpdate() core.StateUpdate {
+	return core.StateUpdate{
+		BlockHash: felt.NewFromUint64[felt.Felt](23),
+		NewRoot:   felt.NewFromUint64[felt.Felt](24),
+		OldRoot:   felt.NewFromUint64[felt.Felt](25),
+		StateDiff: &core.StateDiff{
+			StorageDiffs: map[felt.Felt]map[felt.Felt]*felt.Felt{
+				felt.FromUint64[felt.Felt](26): {
+					felt.FromUint64[felt.Felt](27): felt.NewFromUint64[felt.Felt](28),
+				},
+			},
+			Nonces: map[felt.Felt]*felt.Felt{
+				felt.FromUint64[felt.Felt](29): felt.NewFromUint64[felt.Felt](30),
+			},
+			DeployedContracts: map[felt.Felt]*felt.Felt{
+				felt.FromUint64[felt.Felt](31): felt.NewFromUint64[felt.Felt](32),
+			},
+			DeclaredV0Classes: []*felt.Felt{felt.NewFromUint64[felt.Felt](33)},
+			DeclaredV1Classes: map[felt.Felt]*felt.Felt{
+				felt.FromUint64[felt.Felt](34): felt.NewFromUint64[felt.Felt](35),
+			},
+			ReplacedClasses: map[felt.Felt]*felt.Felt{
+				felt.FromUint64[felt.Felt](36): felt.NewFromUint64[felt.Felt](37),
+			},
+			MigratedClasses: map[felt.SierraClassHash]felt.CasmClassHash{
+				felt.FromUint64[felt.SierraClassHash](38): felt.FromUint64[felt.CasmClassHash](39),
+			},
+		},
+	}
+}
+
+func populatedHeader() core.Header {
+	return core.Header{
+		Hash:             felt.NewFromUint64[felt.Felt](1),
+		ParentHash:       felt.NewFromUint64[felt.Felt](2),
+		Number:           3,
+		GlobalStateRoot:  felt.NewFromUint64[felt.Felt](4),
+		SequencerAddress: felt.NewFromUint64[felt.Felt](5),
+		TransactionCount: 6,
+		EventCount:       7,
+		Timestamp:        8,
+		ProtocolVersion:  "0.13.2",
+		L1GasPriceETH:    felt.NewFromUint64[felt.Felt](9),
+		Signatures: [][]*felt.Felt{{
+			felt.NewFromUint64[felt.Felt](10),
+			felt.NewFromUint64[felt.Felt](11),
+		}},
+		L1GasPriceSTRK: felt.NewFromUint64[felt.Felt](12),
+		L1DAMode:       core.Blob,
+		L1DataGasPrice: &core.GasPrice{
+			PriceInWei: felt.NewFromUint64[felt.Felt](13),
+			PriceInFri: felt.NewFromUint64[felt.Felt](14),
+		},
+		L2GasPrice: &core.GasPrice{
+			PriceInWei: felt.NewFromUint64[felt.Felt](15),
+			PriceInFri: felt.NewFromUint64[felt.Felt](16),
+		},
+	}
+}
+
+func populatedInvokeTransaction() core.InvokeTransaction {
+	version := core.TransactionVersion(felt.FromUint64[felt.Felt](3))
+	return core.InvokeTransaction{
+		TransactionHash:       felt.NewFromUint64[felt.Felt](1),
+		CallData:              []felt.Felt{felt.FromUint64[felt.Felt](2)},
+		TransactionSignature:  []felt.Felt{felt.FromUint64[felt.Felt](3), felt.FromUint64[felt.Felt](4)},
+		MaxFee:                felt.NewFromUint64[felt.Felt](5),
+		ContractAddress:       felt.NewFromUint64[felt.Felt](6),
+		Version:               &version,
+		EntryPointSelector:    felt.NewFromUint64[felt.Felt](7),
+		Nonce:                 felt.NewFromUint64[felt.Felt](8),
+		SenderAddress:         felt.NewFromUint64[felt.Felt](9),
+		Tip:                   10,
+		PaymasterData:         []felt.Felt{felt.FromUint64[felt.Felt](11)},
+		AccountDeploymentData: []felt.Felt{felt.FromUint64[felt.Felt](12)},
+		NonceDAMode:           core.DAModeL2,
+		FeeDAMode:             core.DAModeL1,
+		ResourceBounds: map[core.Resource]core.ResourceBounds{
+			core.ResourceL1Gas:     {MaxAmount: 13, MaxPricePerUnit: felt.NewFromUint64[felt.Felt](14)},
+			core.ResourceL2Gas:     {MaxAmount: 15, MaxPricePerUnit: felt.NewFromUint64[felt.Felt](16)},
+			core.ResourceL1DataGas: {MaxAmount: 17, MaxPricePerUnit: felt.NewFromUint64[felt.Felt](18)},
+		},
+	}
+}
+
+func populatedReceipt() core.TransactionReceipt {
+	return core.TransactionReceipt{
+		Fee:             felt.NewFromUint64[felt.Felt](1),
+		FeeUnit:         core.STRK,
+		TransactionHash: felt.NewFromUint64[felt.Felt](2),
+		Reverted:        true,
+		RevertReason:    "some reason",
+		Events: []*core.Event{{
+			From: felt.NewFromUint64[felt.Felt](3),
+			Keys: []felt.Felt{felt.FromUint64[felt.Felt](4)},
+			Data: []felt.Felt{felt.FromUint64[felt.Felt](5)},
+		}},
+		L2ToL1Message: []*core.L2ToL1Message{{
+			From:    felt.NewFromUint64[felt.Felt](6),
+			Payload: []felt.Felt{felt.FromUint64[felt.Felt](7)},
+			To:      eth.Address{0x1, 0x2},
+		}},
+		ExecutionResources: &core.ExecutionResources{
+			BuiltinInstanceCounter: core.BuiltinInstanceCounter{Pedersen: 8},
+			MemoryHoles:            9,
+			Steps:                  10,
+			DataAvailability:       &core.DataAvailability{L1Gas: 11, L1DataGas: 12},
+			TotalGasConsumed:       &core.GasConsumed{L1Gas: 13, L1DataGas: 14},
+		},
+	}
+}

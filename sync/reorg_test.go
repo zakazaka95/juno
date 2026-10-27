@@ -18,9 +18,9 @@ import (
 	statetestutils "github.com/NethermindEth/juno/core/state/testutils"
 	"github.com/NethermindEth/juno/db/memory"
 	"github.com/NethermindEth/juno/genesis"
-	"github.com/NethermindEth/juno/starknet"
 	"github.com/NethermindEth/juno/starknet/compiler"
 	"github.com/NethermindEth/juno/sync"
+	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/NethermindEth/juno/vm"
 	"github.com/stretchr/testify/assert"
@@ -60,30 +60,6 @@ func (t *testBlockDataSource) BlockHeaderLatest(ctx context.Context) (*core.Head
 	}
 
 	return getBlock(blocks, uint64(len(blocks)-1)).Block.Header, nil
-}
-
-func (t *testBlockDataSource) PreConfirmedBlockByNumber(
-	ctx context.Context,
-	blockNumber uint64,
-	blockIdentifier string,
-	knownTransactionCount uint64,
-) (starknet.PreConfirmedUpdate, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (t *testBlockDataSource) PreConfirmedBlockLatest(
-	ctx context.Context,
-	blockIdentifier string,
-	knownTransactionCount uint64,
-) (starknet.PreConfirmedUpdate, uint64, error) {
-	return nil, 0, errors.New("not implemented")
-}
-
-func (t *testBlockDataSource) Class(
-	ctx context.Context,
-	classHash *felt.Felt,
-) (core.ClassDefinition, error) {
-	return nil, errors.New("not implemented")
 }
 
 func (t *testBlockDataSource) setBlocks(blocks []sync.CommittedBlock) {
@@ -213,6 +189,7 @@ func (b *blockGenerator) mine(t *testing.T, dataSource *testBlockDataSource, cou
 			commitments,
 			committedBlock.StateUpdate,
 			committedBlock.NewClasses,
+			core.EventsBloom(committedBlock.Block.Receipts),
 		)
 		require.NoError(t, err)
 	}
@@ -276,7 +253,13 @@ func setup(
 	t.Cleanup(wg.Wait)
 	t.Cleanup(cancel)
 	wg.Go(func() {
-		synchronizer := sync.New(blockchain, dataSource, logger, 0, false, synchronizerDatabase)
+		synchronizer := sync.New(
+			blockchain,
+			dataSource,
+			nil,
+			logger,
+			sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
+		)
 		require.NoError(t, synchronizer.Run(ctx))
 	})
 

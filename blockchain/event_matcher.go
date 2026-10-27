@@ -104,8 +104,32 @@ func (e *EventMatcher) TestBloom(bloomFilter *bloom.BloomFilter) bool {
 	return possibleMatches
 }
 
+// matchesAllBlocks reports whether every block is a candidate at the bloom
+// level: no addresses and no keys at any position. Such a matcher never needs
+// bloom data.
+func (e *EventMatcher) matchesAllBlocks() bool {
+	if len(e.contractAddressBytes) > 0 {
+		return false
+	}
+	for _, kMap := range e.keysMap {
+		if len(kMap) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// blockKeyFilter is the candidate-block lookup shared by the decoded
+// aggregated filter and its raw-blob view.
+type blockKeyFilter interface {
+	BlocksForKeysInto(keys [][]byte, out *bitset.BitSet) error
+}
+
 // Returns candidate possibly matching block in the given filter.
-func (e *EventMatcher) getCandidateBlocksForFilterInto(filter *core.AggregatedBloomFilter, out *bitset.BitSet) error {
+func (e *EventMatcher) getCandidateBlocksForFilterInto(
+	filter blockKeyFilter,
+	out *bitset.BitSet,
+) error {
 	if out == nil {
 		return core.ErrMatchesBufferNil
 	}

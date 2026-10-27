@@ -1,8 +1,9 @@
 ---
 title: FAQ
+description: "Answers to common Juno questions: requirements, updating, databases, and frequent startup errors."
 ---
 
-# Frequently Asked Questions :question:
+# Frequently Asked Questions
 
 <details>
   <summary>What is Juno?</summary>

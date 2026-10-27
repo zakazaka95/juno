@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder"
 	"github.com/NethermindEth/juno/blockchain"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
@@ -13,8 +14,8 @@ import (
 	"github.com/NethermindEth/juno/db/memory"
 	"github.com/NethermindEth/juno/mocks"
 	junoplugin "github.com/NethermindEth/juno/plugin"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/NethermindEth/juno/sync"
+	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -50,10 +51,9 @@ func TestPlugin(t *testing.T) {
 	synchronizer := sync.New(
 		bc,
 		dataSource,
+		integGw,
 		log.NewNopZapLogger(),
-		0,
-		false,
-		nil,
+		sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
 	).WithPlugin(plugin)
 
 	ctx, cancel := context.WithTimeout(t.Context(), timeout)
@@ -89,10 +89,9 @@ func TestPlugin(t *testing.T) {
 		synchronizer = sync.New(
 			bc,
 			dataSource,
+			mainGw,
 			log.NewNopZapLogger(),
-			0,
-			false,
-			nil,
+			sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
 		).WithPlugin(plugin)
 		ctx, cancel = context.WithTimeout(t.Context(), timeout)
 		require.NoError(t, synchronizer.Run(ctx))

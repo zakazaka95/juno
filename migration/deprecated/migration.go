@@ -25,14 +25,13 @@ import (
 	"github.com/NethermindEth/juno/db/typed"
 	"github.com/NethermindEth/juno/db/typed/key"
 	"github.com/NethermindEth/juno/db/typed/value"
-	"github.com/NethermindEth/juno/encoder"
 	"github.com/NethermindEth/juno/migration/blocktransactions/txlayout"
 	"github.com/NethermindEth/juno/migration/deprecated/casmhashmetadata"
 	"github.com/NethermindEth/juno/migration/deprecated/l1handlermapping"
 	"github.com/NethermindEth/juno/starknet"
+	"github.com/NethermindEth/juno/utils/cbor"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/bits-and-blooms/bitset"
-	"github.com/fxamacker/cbor/v2"
 	"github.com/sourcegraph/conc/pool"
 	"go.uber.org/zap"
 )
@@ -79,22 +78,35 @@ func (f MigrationFunc) Before(_ []byte) error { return nil }
 
 // defaultMigrations contains a set of migrations that can be applied to a database.
 // After making breaking changes to the DB layout, add new migrations to this list.
+//
+//nolint:staticcheck,nolintlint // old state layout
 var defaultMigrations = []Migration{
 	MigrationFunc(migration0000),
 	MigrationFunc(relocateContractStorageRootKeys),
 	MigrationFunc(recalculateBloomFilters),
 	new(changeTrieNodeEncoding),
 	MigrationFunc(calculateBlockCommitments),
-	NewBucketMigrator(db.ClassesTrie, migrateTrieRootKeysFromBitsetToTrieKeys).WithKeyFilter(rootKeysFilter(db.ClassesTrie)),
-	NewBucketMigrator(db.StateTrie, migrateTrieRootKeysFromBitsetToTrieKeys).WithKeyFilter(rootKeysFilter(db.StateTrie)),
-	NewBucketMigrator(db.ContractStorage, migrateTrieRootKeysFromBitsetToTrieKeys).WithKeyFilter(rootKeysFilter(db.ContractStorage)),
-	NewBucketMigrator(db.ClassesTrie, migrateTrieNodesFromBitsetToTrieKey(db.ClassesTrie)).WithKeyFilter(nodesFilter(db.ClassesTrie)),
-	NewBucketMover(db.Temporary, db.ClassesTrie),
-	NewBucketMigrator(db.StateTrie, migrateTrieNodesFromBitsetToTrieKey(db.StateTrie)).WithKeyFilter(nodesFilter(db.StateTrie)),
-	NewBucketMover(db.Temporary, db.StateTrie),
-	NewBucketMigrator(db.ContractStorage, migrateTrieNodesFromBitsetToTrieKey(db.ContractStorage)).
-		WithKeyFilter(nodesFilter(db.ContractStorage)),
-	NewBucketMover(db.Temporary, db.ContractStorage),
+	NewBucketMigrator(db.DeprecatedClassesTrie, migrateTrieRootKeysFromBitsetToTrieKeys).
+		WithKeyFilter(rootKeysFilter(db.DeprecatedClassesTrie)),
+	NewBucketMigrator(db.DeprecatedStateTrie, migrateTrieRootKeysFromBitsetToTrieKeys).
+		WithKeyFilter(rootKeysFilter(db.DeprecatedStateTrie)),
+	NewBucketMigrator(db.DeprecatedContractStorage, migrateTrieRootKeysFromBitsetToTrieKeys).
+		WithKeyFilter(rootKeysFilter(db.DeprecatedContractStorage)),
+	NewBucketMigrator(
+		db.DeprecatedClassesTrie,
+		migrateTrieNodesFromBitsetToTrieKey(db.DeprecatedClassesTrie),
+	).WithKeyFilter(nodesFilter(db.DeprecatedClassesTrie)),
+	NewBucketMover(db.Temporary, db.DeprecatedClassesTrie),
+	NewBucketMigrator(
+		db.DeprecatedStateTrie,
+		migrateTrieNodesFromBitsetToTrieKey(db.DeprecatedStateTrie),
+	).WithKeyFilter(nodesFilter(db.DeprecatedStateTrie)),
+	NewBucketMover(db.Temporary, db.DeprecatedStateTrie),
+	NewBucketMigrator(
+		db.DeprecatedContractStorage,
+		migrateTrieNodesFromBitsetToTrieKey(db.DeprecatedContractStorage),
+	).WithKeyFilter(nodesFilter(db.DeprecatedContractStorage)),
+	NewBucketMover(db.Temporary, db.DeprecatedContractStorage),
 	NewBucketMigrator(db.StateUpdatesByBlockNumber, changeStateDiffStruct2).WithBatchSize(100), //nolint:mnd
 	NewBucketMigrator(db.Class, migrateCairo1CompiledClass2).WithBatchSize(1_000),              //nolint:mnd
 	MigrationFunc(calculateL1MsgHashes2),
@@ -310,7 +322,7 @@ func relocateContractStorageRootKeys(txn db.IndexedBatch, _ *networks.Network) e
 			return errors.New("prefix not found")
 		}
 
-		if err := txn.Put(db.ContractStorage.Key(contractAddress), value); err != nil {
+		if err := txn.Put(db.DeprecatedContractStorage.Key(contractAddress), value); err != nil {
 			return err
 		}
 		if err := txn.Delete(oldKeyBytes); err != nil {
@@ -321,20 +333,29 @@ func relocateContractStorageRootKeys(txn db.IndexedBatch, _ *networks.Network) e
 	return nil
 }
 
-// recalculateBloomFilters updates bloom filters in block headers to match what the most recent implementation expects
+// recalculateBloomFilters recomputes each block header's embedded event bloom
+// filter from the block's receipts and writes it back. This runs before the
+// bloom is stripped out of headers, so it reads and writes the legacy
+// bloom-carrying header layout via DeprecatedBlockHeader. Receipts are read via
+// the legacy per-transaction layout because this runs before the
+// blocktransactions migration moves them to the combined per-block layout.
 //
 //nolint:staticcheck // [db.IndexedBatch] is necessary for deprecated migrations
 func recalculateBloomFilters(txn db.IndexedBatch, _ *networks.Network) error {
 	for blockNumber := uint64(0); ; blockNumber++ {
-		block, err := txlayout.TransactionLayoutPerTx.BlockByNumber(txn, blockNumber)
+		header, err := getDeprecatedBlockHeader(txn, blockNumber)
 		if err != nil {
 			if errors.Is(err, db.ErrKeyNotFound) {
 				return nil
 			}
 			return err
 		}
-		block.EventsBloom = core.EventsBloom(block.Receipts)
-		if err = core.WriteBlockHeader(txn, block.Header); err != nil {
+		receipts, err := txlayout.TransactionLayoutPerTx.ReceiptsByBlockNumber(txn, blockNumber)
+		if err != nil {
+			return err
+		}
+		header.EventsBloom = core.EventsBloom(receipts)
+		if err = writeDeprecatedBlockHeader(txn, header); err != nil {
 			return err
 		}
 	}
@@ -360,16 +381,16 @@ func (m *changeTrieNodeEncoding) Before(_ []byte) error {
 		seekTo  []byte
 		skipLen int
 	}{
-		db.ClassesTrie: {
-			seekTo:  db.ClassesTrie.Key(),
+		db.DeprecatedClassesTrie: { //nolint:staticcheck,nolintlint // old state layout
+			seekTo:  db.DeprecatedClassesTrie.Key(), //nolint:staticcheck,nolintlint // old state layout
 			skipLen: 1,
 		},
-		db.StateTrie: {
-			seekTo:  db.StateTrie.Key(),
+		db.DeprecatedStateTrie: { //nolint:staticcheck,nolintlint // old state layout
+			seekTo:  db.DeprecatedStateTrie.Key(), //nolint:staticcheck,nolintlint // old state layout
 			skipLen: 1,
 		},
-		db.ContractStorage: {
-			seekTo:  db.ContractStorage.Key(),
+		db.DeprecatedContractStorage: { //nolint:staticcheck,nolintlint // old state layout
+			seekTo:  db.DeprecatedContractStorage.Key(), //nolint:staticcheck,nolintlint // old state layout
 			skipLen: 1 + felt.Bytes,
 		},
 	}
@@ -482,7 +503,7 @@ func (m *changeTrieNodeEncoding) Migrate(
 				return err
 			}
 
-			if err = encoder.Unmarshal(v, &n); err != nil {
+			if err = cbor.Unmarshal(v, &n); err != nil {
 				return err
 			}
 
@@ -629,9 +650,9 @@ func migrateTrieRootKeysFromBitsetToTrieKeys(
 }
 
 var rootKeysLen = map[db.Bucket]int{
-	db.ClassesTrie:     1,
-	db.StateTrie:       1,
-	db.ContractStorage: 1 + felt.Bytes,
+	db.DeprecatedClassesTrie:     1,              //nolint:staticcheck,nolintlint // old state layout
+	db.DeprecatedStateTrie:       1,              //nolint:staticcheck,nolintlint // old state layout
+	db.DeprecatedContractStorage: 1 + felt.Bytes, //nolint:staticcheck,nolintlint // old state layout
 }
 
 func rootKeysFilter(target db.Bucket) BucketMigratorKeyFilter {
@@ -716,7 +737,7 @@ type oldStateUpdate struct {
 
 func changeStateDiffStruct2(txn db.KeyValueWriter, key, value []byte, _ *networks.Network) error {
 	old := new(oldStateUpdate)
-	if err := encoder.Unmarshal(value, old); err != nil {
+	if err := cbor.Unmarshal(value, old); err != nil {
 		return fmt.Errorf("unmarshal: %v", err)
 	}
 
@@ -747,7 +768,7 @@ func changeStateDiffStruct2(txn db.KeyValueWriter, key, value []byte, _ *network
 		replacedClasses[*replacedClass.Address] = replacedClass.ClassHash
 	}
 
-	newValue, err := encoder.Marshal(&core.StateUpdate{
+	newValue, err := cbor.Marshal(&core.StateUpdate{
 		BlockHash: old.BlockHash,
 		NewRoot:   old.NewRoot,
 		OldRoot:   old.OldRoot,
@@ -800,9 +821,10 @@ func migrateCairo1CompiledClass2(
 	_ *networks.Network,
 ) error {
 	var class declaredClass
-	err := encoder.Unmarshal(value, &class)
+	err := cbor.Unmarshal(value, &class)
 	if err != nil {
 		// assumption that only Cairo0 class causes this error
+		// TODO(granza): discriminate the record by its own shape, not by the error.
 		targetErr := new(cbor.UnmarshalTypeError)
 		if errors.As(err, &targetErr) {
 			return nil
@@ -838,7 +860,7 @@ func migrateCairo1CompiledClass2(
 		},
 	}
 
-	value, err = encoder.Marshal(declaredClass)
+	value, err = cbor.Marshal(declaredClass)
 	if err != nil {
 		return err
 	}
@@ -875,7 +897,7 @@ func reconstructAggregatedBloomFilters(txn db.IndexedBatch, network *networks.Ne
 			filter := core.NewAggregatedFilter(start)
 
 			for blockNum := rangeStart; blockNum <= rangeEnd; blockNum++ {
-				header, err := core.GetBlockHeaderByNumber(txn, blockNum)
+				header, err := getDeprecatedBlockHeader(txn, blockNum)
 				if err != nil {
 					return fmt.Errorf("failed to load block header %d: %w", blockNum, err)
 				}
@@ -910,7 +932,7 @@ func reconstructAggregatedBloomFilters(txn db.IndexedBatch, network *networks.Ne
 	runningFilter := core.NewRunningEventFilterHot(nil, &filter, runningFilterStart)
 
 	for blockNum := runningFilterStart; blockNum <= chainHeight; blockNum++ {
-		header, err := core.GetBlockHeaderByNumber(txn, blockNum)
+		header, err := getDeprecatedBlockHeader(txn, blockNum)
 		if err != nil {
 			return fmt.Errorf("failed to load block header %d: %w", blockNum, err)
 		}
@@ -967,7 +989,7 @@ func calculateCasmClassHashesV2(txn db.IndexedBatch, network *networks.Network) 
 		workerPool.Go(
 			func() error {
 				var declaredClass core.DeclaredClassDefinition
-				if err := encoder.Unmarshal(value, &declaredClass); err != nil {
+				if err := cbor.Unmarshal(value, &declaredClass); err != nil {
 					return err
 				}
 

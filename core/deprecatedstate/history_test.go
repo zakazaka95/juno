@@ -9,7 +9,7 @@ import (
 	"github.com/NethermindEth/juno/core/felt"
 	"github.com/NethermindEth/juno/db"
 	"github.com/NethermindEth/juno/db/memory"
-	_ "github.com/NethermindEth/juno/encoder/registry"
+	_ "github.com/NethermindEth/juno/utils/cbor/registry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -255,7 +255,8 @@ func TestContractStorageSkipsDeploymentProbeForNonZeroValue(t *testing.T) {
 		},
 	}, nil, true))
 
-	require.NoError(t, txn.Delete(db.ContractDeploymentHeightKey(addr)))
+	//nolint:staticcheck,nolintlint // old state layout
+	require.NoError(t, txn.Delete(db.DeprecatedContractDeploymentHeightKey(addr)))
 
 	t.Run("value from history entry", func(t *testing.T) {
 		snapshot := deprecatedstate.NewHistory(state, deployedHeight)

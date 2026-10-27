@@ -2,7 +2,8 @@ package rpcv10
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -101,13 +102,12 @@ type SimulateTransactionsResponse struct {
 	InitialReads          *InitialReads          `json:"initial_reads"`
 }
 
-func (r SimulateTransactionsResponse) MarshalJSON() ([]byte, error) {
+func (r SimulateTransactionsResponse) MarshalJSONTo(enc *jsontext.Encoder) error {
 	if r.InitialReads == nil {
-		return json.Marshal(r.SimulatedTransactions)
+		return json.MarshalEncode(enc, r.SimulatedTransactions)
 	}
 	type simulateTransactionsResponse SimulateTransactionsResponse
-	response := simulateTransactionsResponse(r)
-	return json.Marshal(response)
+	return json.MarshalEncode(enc, simulateTransactionsResponse(r))
 }
 
 type TracedBlockTransaction struct {
@@ -123,13 +123,12 @@ type TraceBlockTransactionsResponse struct {
 	InitialReads *InitialReads            `json:"initial_reads"`
 }
 
-func (r TraceBlockTransactionsResponse) MarshalJSON() ([]byte, error) {
+func (r TraceBlockTransactionsResponse) MarshalJSONTo(enc *jsontext.Encoder) error {
 	if r.InitialReads == nil {
-		return json.Marshal(r.Traces)
+		return json.MarshalEncode(enc, r.Traces)
 	}
 	type traceBlockTransactionsResponse TraceBlockTransactionsResponse
-	response := traceBlockTransactionsResponse(r)
-	return json.Marshal(response)
+	return json.MarshalEncode(enc, traceBlockTransactionsResponse(r))
 }
 
 type StorageEntry struct {
@@ -197,20 +196,20 @@ func (h *Handler) simulateBroadcastedTransactions(
 		return SimulateTransactionsResponse{}, httpHeader, rpcErr
 	}
 
-	state, closer, rpcErr := h.stateByBlockID(id)
+	state, closer, header, rpcErr := h.stateAndHeaderByBlockID(id)
 	if rpcErr != nil {
 		return SimulateTransactionsResponse{}, httpHeader, rpcErr
 	}
 	defer h.callAndLogErr(closer, "Failed to close state after simulating transactions")
 
 	return h.simulateTransactions(
-		state, id, txns, classes, simulationFlags, errOnRevert, isEstimateFee,
+		state, header, txns, classes, simulationFlags, errOnRevert, isEstimateFee,
 	)
 }
 
 func (h *Handler) simulateTransactions(
 	state core.StateReader,
-	id *BlockID,
+	header *core.Header,
 	txns []core.Transaction,
 	classes []core.ClassDefinition,
 	simulationFlags []SimulationFlag,
@@ -223,11 +222,6 @@ func (h *Handler) simulateTransactions(
 
 	httpHeader := http.Header{}
 	httpHeader.Set(ExecutionStepsHeader, "0")
-
-	header, rpcErr := h.blockHeaderByID(id)
-	if rpcErr != nil {
-		return SimulateTransactionsResponse{}, httpHeader, rpcErr
-	}
 
 	blockHashToBeRevealed, err := h.getRevealedBlockHash(header.Number)
 	if err != nil {

@@ -33,7 +33,7 @@ PKG ?= ./...
 
 MAKEFLAGS += -j$(NPROCS)
 
-rustdeps: check-rust vm compiler
+rustdeps: check-rust vm
 
 juno: rustdeps ## Compile Juno
 	@mkdir -p build
@@ -47,6 +47,10 @@ corpus-gen: ## Build the corpus generator
 	@mkdir -p build
 	@go build -o build/corpus-gen ./bench/rpc/cmd/corpus-gen
 
+feeder-sim: ## Build the feeder gateway simulator
+	@mkdir -p build
+	@go build -o build/feeder-sim ./bench/sync/cmd/feeder-sim
+
 MINIMUM_RUST_VERSION = 1.94.1
 CURR_RUST_VERSION = $(shell rustc --version | grep -o '[0-9.]\+' | head -n1)
 check-rust: ## Ensure rust version is greater than minimum
@@ -55,9 +59,6 @@ check-rust: ## Ensure rust version is greater than minimum
 
 vm:
 	$(MAKE) -C vm/rust $(VM_TARGET)
-
-compiler:
-	$(MAKE) -C starknet/compiler/rust $(VM_TARGET)
 
 generate-buf: ## Generate protobuf files
 	@buf generate
@@ -123,20 +124,16 @@ tidy: ## Add missing and remove unused modules
 
 rust-format-check: ## Check Rust formatting across all crates
 	$(MAKE) -C vm/rust format-check
-	$(MAKE) -C starknet/compiler/rust format-check
 
 rust-lint: ## Run clippy on all Rust crates
 	$(MAKE) -C vm/rust lint
-	$(MAKE) -C starknet/compiler/rust lint
 
 format: ## Format Go and Rust code
 	$(MAKE) -C vm/rust format
-	$(MAKE) -C starknet/compiler/rust format
 	gofumpt -l -w .
 
 clean: ## Clean project builds
 	$(MAKE) -C vm/rust clean
-	$(MAKE) -C starknet/compiler/rust clean
 	@rm -rf ./build
 
 help: ## Show help

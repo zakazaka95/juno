@@ -16,11 +16,12 @@ import (
 	"time"
 
 	"github.com/NethermindEth/juno/blockchain/networks"
-	_ "github.com/NethermindEth/juno/encoder/registry"
 	_ "github.com/NethermindEth/juno/jemalloc"
 	"github.com/NethermindEth/juno/l1/eth"
 	"github.com/NethermindEth/juno/node"
+	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils"
+	_ "github.com/NethermindEth/juno/utils/cbor/registry"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/NethermindEth/juno/vm"
 	"github.com/mitchellh/mapstructure"
@@ -60,6 +61,8 @@ const (
 	pprofPortF                          = "pprof-port"
 	colourF                             = "colour"
 	preConfirmedPollIntervalF           = "preconfirmed-poll-interval"
+	preConfirmedStaleAfterF             = "preconfirmed-stale-after"
+	preConfirmedOnDemandWaitF           = "preconfirmed-on-demand-wait"
 	disableSyncF                        = "disable-sync"
 	p2pF                                = "p2p"
 	p2pAddrF                            = "p2p-addr"
@@ -135,7 +138,9 @@ const (
 	defaultPprof                              = false
 	defaultPprofPort                          = 6062
 	defaultColour                             = true
-	defaultPreConfirmedPollInterval           = 500 * time.Millisecond
+	defaultPreConfirmedPollInterval           = preconfirmed.DefaultPollInterval
+	defaultPreConfirmedStaleAfter             = preconfirmed.DefaultStaleAfter
+	defaultPreConfirmedOnDemandWait           = preconfirmed.DefaultOnDemandWait
 	defaultDisableSync                        = false
 	defaultP2p                                = false
 	defaultP2pAddr                            = ""
@@ -221,6 +226,12 @@ const (
 	disableL1VerificationUsage    = "Disables L1 verification since an Ethereum node is not provided."
 	preConfirmedPollIntervalUsage = "Sets how frequently pre_confirmed block will be updated" +
 		"(0s will disable fetching of pre_confirmed block)."
+	preConfirmedStaleAfterUsage = "How long after a pre_confirmed poll its result is served " +
+		"as is. Once stale, an RPC request reading the pre_confirmed block triggers a new poll " +
+		"first (0s: every request polls)."
+	preConfirmedOnDemandWaitUsage = "Maximum time an RPC request waits for the pre_confirmed " +
+		"poll it triggered before answering with the pre_confirmed block already stored " +
+		"(0s: never waits)."
 	disableSyncUsage   = "Disables L2 synchronization."
 	p2pUsage           = "EXPERIMENTAL: Enables p2p server."
 	p2pAddrUsage       = "EXPERIMENTAL: Specify p2p listening source address as multiaddr.  Example: /ip4/0.0.0.0/tcp/7777"
@@ -274,16 +285,17 @@ const (
 	dbCompressionUsage = "Database compression profile. Options: zstd, snappy, minlz. " +
 		"Use zstd for low storage."
 	rpcRequestTimeoutUsage        = "Maximum time for an RPC request to complete."
-	rpcMaxConcurrentRequestsUsage = "Maximum concurrent HTTP RPC requests; 0 disables the limit."
-	rpcMaxRequestQueueUsage       = "Maximum number of HTTP RPC requests to queue after " +
-		"reaching rpc-max-concurrent-requests limit."
+	rpcMaxConcurrentRequestsUsage = "Maximum concurrent RPC requests, over HTTP and websocket " +
+		"together; 0 disables the limit."
+	rpcMaxRequestQueueUsage = "Maximum number of HTTP RPC requests to queue after " +
+		"reaching rpc-max-concurrent-requests limit. Websocket requests are never queued."
 	rpcMaxBatchSizeUsage = "Maximum number of calls in a single batch request. " +
 		"0 disables the limit."
 	rpcMaxBatchResponseSizeUsage = "Size (in MBs) at which a batch stops being processed. " +
 		"The calls answered so far are returned, the rest are not executed. " +
 		"0 disables the limit."
-	rpcBatchConcurrencyUsage = "Maximum batch calls that run at the same time, per RPC version. " +
-		"All batch requests to a version share this limit. " +
+	rpcBatchConcurrencyUsage = "Maximum batch calls that run at the same time. " +
+		"Every batch request shares this limit, across all RPC versions. " +
 		"Default is set based on available hardware resources."
 	maxConcurrentCompilationsUsage = "Maximum concurrent Sierra compilations. " +
 		"Default is set based on available hardware resources."
@@ -311,7 +323,7 @@ const (
 		"window cannot be recovered without re-syncing. Changing this value " +
 		"across restarts is safe: the window grows or shrinks accordingly. " +
 		"Growth is gradual — pruning pauses until the pivot advances enough to " +
-		"reach the new floor."
+		"reach the new floor. Cannot be combined with --new-state."
 	pruneMinAgeUsage = "Protect blocks whose on-chain timestamp is " +
 		"younger than this duration from being pruned. Acts as an " +
 		"additional floor on top of --prune-mode: a block is retained " +
@@ -328,7 +340,8 @@ const (
 		"submitted through this node — these transactions are local to the node " +
 		"and are not sourced from the network. When this flag is enabled, the " +
 		"node will no longer notify subscribers about transactions submitted through it."
-	newStateUsage = "EXPERIMENTAL: Use the new state package implementation"
+	newStateUsage = "EXPERIMENTAL: Use the new state package implementation. " +
+		"Cannot be combined with --prune-mode."
 )
 
 var Version string
@@ -579,12 +592,23 @@ func NewCmd(config *node.Config, run func(*cobra.Command, []string) error) *cobr
 	junoCmd.Flags().Duration(
 		preConfirmedPollIntervalF, defaultPreConfirmedPollInterval, preConfirmedPollIntervalUsage,
 	)
+	junoCmd.Flags().Duration(
+		preConfirmedStaleAfterF, defaultPreConfirmedStaleAfter, preConfirmedStaleAfterUsage,
+	)
+	junoCmd.Flags().Duration(
+		preConfirmedOnDemandWaitF, defaultPreConfirmedOnDemandWait, preConfirmedOnDemandWaitUsage,
+	)
 	junoCmd.Flags().String(remoteDBF, defaultRemoteDB, remoteDBUsage)
 	junoCmd.Flags().Uint(
 		readinessBlockToleranceF, defaultReadinessBlockTolerance, readinessBlockToleranceUsage,
 	)
 	setCategory(junoCmd, catSyncPolling,
-		disableSyncF, preConfirmedPollIntervalF, remoteDBF, readinessBlockToleranceF,
+		disableSyncF,
+		preConfirmedPollIntervalF,
+		preConfirmedStaleAfterF,
+		preConfirmedOnDemandWaitF,
+		remoteDBF,
+		readinessBlockToleranceF,
 	)
 
 	// --- Gateway ---

@@ -115,10 +115,11 @@ func (s *transactionsSubscriberState) onNewHead(
 	_ context.Context,
 	id string,
 	_ *subscription,
-	head *core.Block,
+	headWithBloom *core.WithBloom[*core.Block],
 ) error {
+	head := headWithBloom.Value
 	// Canonical blocks are published exactly once, so they bypass the deduper.
-	for txn := range transactionsOf(head, s.senders, TxnStatusWithoutL1(TxnStatusAcceptedOnL2)) {
+	for txn := range transactionsOf(head, s.senders, TxnStatusWithoutL1(TxnStatusAcceptedOnL2), nil) {
 		if err := sendTransaction(s.conn, txn, id); err != nil {
 			return err
 		}
@@ -130,22 +131,22 @@ func (s *transactionsSubscriberState) onPreConfirmed(
 	_ context.Context,
 	id string,
 	_ *subscription,
-	preConfirmed *pending.PreConfirmed,
+	preConfirmedWithBloom *core.WithBloom[*pending.PreConfirmed],
 ) error {
+	preConfirmed := preConfirmedWithBloom.Value
 	block := preConfirmed.GetBlock()
 	status := TxnStatusWithoutL1(TxnStatusPreConfirmed)
 	// The pre_confirmed tip is re-published in full on every delta; skip already-sent
 	// transactions. A same-height round replacement changes BlockIdentifier and re-emits.
-	for txn := range transactionsOf(block, s.senders, status) {
-		shouldSend := s.deduper.MarkSent(
+	shouldSend := func(txn core.Transaction) bool {
+		return s.deduper.MarkSent(
 			block.Number,
 			preConfirmed.BlockIdentifier,
-			(*felt.TransactionHash)(txn.Hash),
+			(*felt.TransactionHash)(txn.Hash()),
 		)
-		if !shouldSend {
-			continue
-		}
+	}
 
+	for txn := range transactionsOf(block, s.senders, status, shouldSend) {
 		if err := sendTransaction(s.conn, txn, id); err != nil {
 			return err
 		}
@@ -159,10 +160,15 @@ func transactionsOf(
 	b *core.Block,
 	senders []felt.Felt,
 	finalityStatus TxnStatusWithoutL1,
+	shouldSend func(core.Transaction) bool,
 ) iter.Seq[*SubscriptionNewTransaction] {
 	return func(yield func(*SubscriptionNewTransaction) bool) {
 		for _, txn := range b.Transactions {
 			if !filterTxBySender(txn, senders) {
+				continue
+			}
+
+			if shouldSend != nil && !shouldSend(txn) {
 				continue
 			}
 

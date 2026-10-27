@@ -56,7 +56,7 @@ func (h *Handler) blockByID(blockID *BlockID) (*core.Block, *jsonrpc.Error) {
 	switch blockID.Type() {
 	case preConfirmed:
 		var chain preconfirmed.ChainReader
-		chain, err = h.syncReader.PreConfirmedChain()
+		chain, err = h.syncReader.RequestPreConfirmedChain()
 		if err == nil {
 			block = chain.Head().Block
 		}
@@ -93,7 +93,7 @@ func (h *Handler) blockHeaderByID(blockID *BlockID) (*core.Header, *jsonrpc.Erro
 	switch blockID.Type() {
 	case preConfirmed:
 		var chain preconfirmed.ChainReader
-		chain, err = h.syncReader.PreConfirmedChain()
+		chain, err = h.syncReader.RequestPreConfirmedChain()
 		if err == nil {
 			header = chain.Head().Block.Header
 		}
@@ -124,6 +124,44 @@ func (h *Handler) blockHeaderByID(blockID *BlockID) (*core.Header, *jsonrpc.Erro
 		return nil, rpccore.ErrInternal.CloneWithData("nil header with no error")
 	}
 	return header, nil
+}
+
+// stateAndHeaderByBlockID returns the state and the header at blockID. For pre_confirmed
+// both come from a single pre-confirmed chain snapshot, so the state of one block is never
+// paired with the header of another.
+func (h *Handler) stateAndHeaderByBlockID(
+	blockID *BlockID,
+) (core.StateReader, blockchain.StateCloser, *core.Header, *jsonrpc.Error) {
+	if !blockID.IsPreConfirmed() {
+		state, closer, rpcErr := h.stateByBlockID(blockID)
+		if rpcErr != nil {
+			return nil, nil, nil, rpcErr
+		}
+		header, rpcErr := h.blockHeaderByID(blockID)
+		if rpcErr != nil {
+			h.callAndLogErr(closer, "Failed to close state after failing to get its header")
+			return nil, nil, nil, rpcErr
+		}
+		return state, closer, header, nil
+	}
+
+	var state core.StateReader
+	var closer blockchain.StateCloser
+	var header *core.Header
+	chain, err := h.syncReader.RequestPreConfirmedChain()
+	if err == nil {
+		head := chain.Head()
+		header = head.Block.Header
+		state, closer, err = chain.PreConfirmedStateAt(head.Block.Number, h.bcReader)
+	}
+
+	if err != nil {
+		if errors.Is(err, db.ErrKeyNotFound) || errors.Is(err, pending.ErrPreConfirmedNotFound) {
+			return nil, nil, nil, rpccore.ErrBlockNotFound
+		}
+		return nil, nil, nil, rpccore.ErrInternal.CloneWithData(err)
+	}
+	return state, closer, header, nil
 }
 
 func adaptExecutionResources(resources *core.ExecutionResources) ExecutionResources {
@@ -188,7 +226,7 @@ func (h *Handler) stateByBlockID(
 	switch blockID.Type() {
 	case preConfirmed:
 		var chain preconfirmed.ChainReader
-		chain, err = h.syncReader.PreConfirmedChain()
+		chain, err = h.syncReader.RequestPreConfirmedChain()
 		if err == nil {
 			reader, closer, err = chain.PreConfirmedStateAt(chain.Head().Block.Number, h.bcReader)
 		}

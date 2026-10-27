@@ -76,25 +76,25 @@ func newRootCmd() *cobra.Command {
 
 	cmd.AddGroup(&cobra.Group{ID: methodsGroupID, Title: "RPC Methods:"})
 	cmd.AddCommand(
-		newSampledCmd(cfg, "starknet_getBlockWithTxHashes", blockIDSampler),
-		newSampledCmd(cfg, "starknet_getBlockWithTxs", blockIDWithProofFactsSampler),
-		newSampledCmd(cfg, "starknet_getBlockWithReceipts", blockIDWithProofFactsSampler),
-		newSampledCmd(cfg, "starknet_getStateUpdate", blockIDSampler),
-		newSampledCmd(cfg, "starknet_getBlockTransactionCount", blockIDSampler),
-		newSampledCmd(cfg, "starknet_traceBlockTransactions", traceBlockTransactionsSampler),
-		newSampledCmd(cfg, "starknet_getTransactionByHash", txHashWithProofFactsSampler),
-		newSampledCmd(cfg, "starknet_getTransactionStatus", txHashSampler),
-		newSampledCmd(cfg, "starknet_getTransactionReceipt", txHashSampler),
-		newSampledCmd(cfg, "starknet_traceTransaction", txHashSampler),
-		newSampledCmd(cfg, "starknet_getTransactionByBlockIdAndIndex", txByBlockIDAndIndexSampler),
-		newSampledCmd(cfg, "starknet_getClassHashAt", contractAddressSampler(storageDiffAddresses)),
-		newSampledCmd(cfg, "starknet_getClassAt", contractAddressSampler(storageDiffAddresses)),
-		newSampledCmd(cfg, "starknet_getNonce", contractAddressSampler(nonceAddresses)),
-		newSampledCmd(cfg, "starknet_getClass", classAtBlockSampler),
-		newSampledCmd(cfg, "starknet_getCompiledCasm", sierraClassHashSampler),
-		newSampledCmd(cfg, "starknet_getStorageAt", storageAtSampler),
-		newSampledCmd(cfg, "starknet_getEvents", eventsSampler),
-		newSampledCmd(cfg, "starknet_getStorageProof", storageProofSampler),
+		cfg.newSampledCmd("starknet_getBlockWithTxHashes", blockIDSampler),
+		cfg.newSampledCmd("starknet_getBlockWithTxs", blockIDWithProofFactsSampler),
+		cfg.newSampledCmd("starknet_getBlockWithReceipts", blockIDWithProofFactsSampler),
+		cfg.newSampledCmd("starknet_getStateUpdate", blockIDSampler),
+		cfg.newSampledCmd("starknet_getBlockTransactionCount", blockIDSampler),
+		cfg.newSampledCmd("starknet_traceBlockTransactions", traceBlockTransactionsSampler),
+		cfg.newSampledCmd("starknet_getTransactionByHash", txHashWithProofFactsSampler),
+		cfg.newSampledCmd("starknet_getTransactionStatus", txHashSampler),
+		cfg.newSampledCmd("starknet_getTransactionReceipt", txHashSampler),
+		cfg.newSampledCmd("starknet_traceTransaction", txHashSampler),
+		cfg.newSampledCmd("starknet_getTransactionByBlockIdAndIndex", txByBlockIDAndIndexSampler),
+		cfg.newSampledCmd("starknet_getClassHashAt", contractAddressSampler(storageDiffAddresses)),
+		cfg.newSampledCmd("starknet_getClassAt", contractAddressSampler(storageDiffAddresses)),
+		cfg.newSampledCmd("starknet_getNonce", contractAddressSampler(nonceAddresses)),
+		cfg.newSampledCmd("starknet_getClass", classAtBlockSampler),
+		cfg.newSampledCmd("starknet_getCompiledCasm", sierraClassHashSampler),
+		cfg.newSampledCmd("starknet_getStorageAt", storageAtSampler),
+		cfg.newSampledCmd("starknet_getEvents", eventsSampler),
+		cfg.newSampledCmd("starknet_getStorageProof", storageProofSampler),
 	)
 	cmd.AddCommand(newNoParamCmds(
 		cfg,
@@ -137,7 +137,7 @@ type jsonRPCRequest struct {
 }
 
 func writeCorpus[T any](w io.Writer, c *corpus[T]) error {
-	data, err := json.MarshalIndent(c, "", "  ")
+	data, err := json.Marshal(c)
 	if err != nil {
 		return err
 	}
@@ -193,7 +193,11 @@ func buildCorpus[T any](
 	stopProgress := reportProgress(progress, &completed, cfg.count)
 	defer stopProgress()
 
-	seed := methodSeed(cfg.seed, method)
+	seed, err := corpusSeed(cfg.seed, method, meta)
+	if err != nil {
+		return nil, fmt.Errorf("derive corpus seed: %w", err)
+	}
+
 	requests := make([]any, cfg.count)
 	p := pool.New().
 		WithContext(ctx).
@@ -271,9 +275,16 @@ func newSeededRand(seed, stream uint64) *rand.Rand {
 	return rand.New(rand.NewPCG(seed, stream))
 }
 
-// methodSeed decorrelates draws across methods; flag variants of one method stay aligned.
-func methodSeed(seed uint64, method string) uint64 {
+// corpusSeed decorrelates draws across methods and their option variants.
+func corpusSeed(seed uint64, method string, sampling any) (uint64, error) {
+	options, err := json.Marshal(sampling)
+	if err != nil {
+		return 0, err
+	}
+
 	h := fnv.New64a()
 	h.Write([]byte(method))
-	return seed ^ h.Sum64()
+	h.Write([]byte{0})
+	h.Write(options)
+	return seed ^ h.Sum64(), nil
 }

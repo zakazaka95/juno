@@ -1,8 +1,9 @@
 ---
 title: Updating
+description: "Update a Juno node to a new release with Docker, a prebuilt binary, or from source."
 ---
 
-# Updating Juno :arrows_counterclockwise:
+# Updating Juno
 
 ```mdx-code-block
 import Tabs from "@theme/Tabs";

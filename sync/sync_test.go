@@ -3,10 +3,12 @@ package sync_test
 import (
 	"context"
 	"errors"
-	"sync/atomic"
+	gosync "sync"
 	"testing"
 	"time"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder"
+	"github.com/NethermindEth/juno/adapters/adaptfeeder/adaptfeedertest"
 	"github.com/NethermindEth/juno/blockchain"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
@@ -16,50 +18,39 @@ import (
 	statetestutils "github.com/NethermindEth/juno/core/state/testutils"
 	"github.com/NethermindEth/juno/db"
 	"github.com/NethermindEth/juno/db/memory"
-	"github.com/NethermindEth/juno/mocks"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/NethermindEth/juno/sync"
+	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/mock/gomock"
 )
 
 const timeout = time.Second
 
 func TestNoopSynchronizerPreConfirmedChain(t *testing.T) {
-	_, err := new(sync.NoopSynchronizer).PreConfirmedChain()
+	_, err := new(sync.NoopSynchronizer).RequestPreConfirmedChain()
 	require.ErrorIs(t, err, pending.ErrPreConfirmedNotFound)
 }
 
 func TestSyncBlocks(t *testing.T) {
-	mockCtrl := gomock.NewController(t)
-	t.Cleanup(mockCtrl.Finish)
-
 	client := feeder.NewTestClient(t, &networks.Mainnet)
 	gw := adaptfeeder.New(client)
 	testBlockchain := func(t *testing.T, bc *blockchain.Blockchain) {
 		t.Helper()
-		assert.NoError(t, func() error {
-			headBlock, err := bc.Head()
+		headBlock, err := bc.Head()
+		require.NoError(t, err)
+
+		height := int(headBlock.Number)
+		assert.Equal(t, 2, height)
+		for height >= 0 {
+			b := adaptfeedertest.Block(t, client, uint64(height))
+
+			block, err := bc.BlockByNumber(uint64(height))
 			require.NoError(t, err)
 
-			height := int(headBlock.Number)
-			assert.Equal(t, 2, height)
-			for height >= 0 {
-				b, err := gw.BlockByNumber(t.Context(), uint64(height))
-				if err != nil {
-					return err
-				}
-
-				block, err := bc.BlockByNumber(uint64(height))
-				require.NoError(t, err)
-
-				assert.Equal(t, b, block)
-				height--
-			}
-			return nil
-		}())
+			assert.Equal(t, b, block)
+			height--
+		}
 	}
 	logger := log.NewNopZapLogger()
 	t.Run("sync multiple blocks in an empty db", func(t *testing.T) {
@@ -71,12 +62,7 @@ func TestSyncBlocks(t *testing.T) {
 		)
 		dataSource := sync.NewFeederGatewayDataSource(bc, gw)
 		synchronizer := sync.New(
-			bc,
-			dataSource,
-			logger,
-			time.Duration(0),
-			false,
-			testDB,
+			bc, dataSource, gw, logger, sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
 		)
 		ctx, cancel := context.WithTimeout(t.Context(), timeout)
 
@@ -93,20 +79,19 @@ func TestSyncBlocks(t *testing.T) {
 			&networks.Mainnet,
 			blockchain.WithNewState(statetestutils.UseNewState()),
 		)
-		b0, err := gw.BlockByNumber(t.Context(), 0)
-		require.NoError(t, err)
-		s0, err := gw.StateUpdate(t.Context(), 0)
-		require.NoError(t, err)
-		require.NoError(t, bc.Store(b0, &core.BlockCommitments{}, s0, nil))
+		b0 := adaptfeedertest.Block(t, client, 0)
+		s0 := adaptfeedertest.StateUpdate(t, client, 0)
+		require.NoError(t, bc.Store(
+			b0,
+			&core.BlockCommitments{},
+			s0,
+			nil,
+			core.EventsBloom(b0.Receipts),
+		))
 
 		dataSource := sync.NewFeederGatewayDataSource(bc, gw)
 		synchronizer := sync.New(
-			bc,
-			dataSource,
-			logger,
-			time.Duration(0),
-			false,
-			testDB,
+			bc, dataSource, gw, logger, sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
 		)
 		ctx, cancel := context.WithTimeout(t.Context(), timeout)
 
@@ -124,60 +109,9 @@ func TestSyncBlocks(t *testing.T) {
 			blockchain.WithNewState(statetestutils.UseNewState()),
 		)
 
-		mockSNData := mocks.NewMockStarknetData(mockCtrl)
-
-		syncingHeight := uint64(0)
-		reqCount := 0
-		mockSNData.EXPECT().StateUpdateWithBlock(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ context.Context, height uint64) (*core.StateUpdate, *core.Block, error) {
-				curHeight := atomic.LoadUint64(&syncingHeight)
-				// reject any other requests
-				if height != curHeight {
-					return nil, nil, errors.New("try again")
-				}
-
-				reqCount++
-				state, block, err := gw.StateUpdateWithBlock(t.Context(), curHeight)
-				if err != nil {
-					return nil, nil, err
-				}
-
-				switch reqCount {
-				case 1:
-					return nil, nil, errors.New("try again")
-				case 2:
-					state.BlockHash = new(felt.Felt) // fail sanity checks
-				case 3:
-					state.OldRoot = new(felt.Felt).SetUint64(1) // fail store
-				default:
-					reqCount = 0
-					atomic.AddUint64(&syncingHeight, 1)
-				}
-
-				return state, block, nil
-			}).AnyTimes()
-		mockSNData.EXPECT().Class(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(ctx context.Context, hash *felt.Felt) (core.ClassDefinition, error) {
-				return gw.Class(ctx, hash)
-			}).AnyTimes()
-
-		mockSNData.EXPECT().BlockHeaderLatest(gomock.Any()).DoAndReturn(
-			func(ctx context.Context) (core.Header, error) {
-				block, err := gw.BlockLatest(t.Context())
-				if err != nil {
-					return core.Header{}, err
-				}
-				return *block.Header, nil
-			}).AnyTimes()
-
-		dataSource := sync.NewFeederGatewayDataSource(bc, mockSNData)
+		dataSource := &unreliableDataSource{DataSource: sync.NewFeederGatewayDataSource(bc, gw)}
 		synchronizer := sync.New(
-			bc,
-			dataSource,
-			logger,
-			time.Duration(0),
-			false,
-			testDB,
+			bc, dataSource, gw, logger, sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
 		)
 		ctx, cancel := context.WithTimeout(t.Context(), 2*timeout)
 
@@ -186,6 +120,50 @@ func TestSyncBlocks(t *testing.T) {
 
 		testBlockchain(t, bc)
 	})
+}
+
+// unreliableDataSource fails BlockByNumber in a fixed pattern before it lets
+// each height through, so the synchronizer's retry path gets exercised.
+type unreliableDataSource struct {
+	sync.DataSource
+	mu            gosync.Mutex
+	syncingHeight uint64
+	reqCount      int
+}
+
+func (u *unreliableDataSource) BlockByNumber(
+	ctx context.Context,
+	height uint64,
+) (sync.CommittedBlock, error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	// reject any other requests
+	if height != u.syncingHeight {
+		return sync.CommittedBlock{}, errors.New("try again")
+	}
+
+	u.reqCount++
+	if u.reqCount == 1 {
+		return sync.CommittedBlock{}, errors.New("try again")
+	}
+
+	committed, err := u.DataSource.BlockByNumber(ctx, height)
+	if err != nil {
+		return sync.CommittedBlock{}, err
+	}
+
+	switch u.reqCount {
+	case 2:
+		committed.StateUpdate.BlockHash = new(felt.Felt) // fail sanity checks
+	case 3:
+		committed.StateUpdate.OldRoot = new(felt.Felt).SetUint64(1) // fail store
+	default:
+		u.reqCount = 0
+		u.syncingHeight++
+	}
+
+	return committed, nil
 }
 
 func TestStartingBlockHeaderFallsBackToBlockchain(t *testing.T) {
@@ -210,10 +188,10 @@ func TestStartingBlockHeaderFallsBackToBlockchain(t *testing.T) {
 	synchronizer := sync.New(
 		bc,
 		dataSource,
+		nil,
 		log.NewNopZapLogger(),
-		time.Duration(0),
-		true,
-		testDB,
+		sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
+		sync.WithReadOnlyBlockchain(true),
 	)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -239,8 +217,7 @@ func TestStartingBlockHeaderFallsBackToBlockchain(t *testing.T) {
 func TestStartingBlockHeaderCachesStoredHeader(t *testing.T) {
 	client := feeder.NewTestClient(t, &networks.Mainnet)
 	gw := adaptfeeder.New(client)
-	block0, err := gw.BlockByNumber(t.Context(), 0)
-	require.NoError(t, err)
+	block0 := adaptfeedertest.Block(t, client, 0)
 
 	testDB := memory.New()
 	bc := blockchain.New(
@@ -252,10 +229,9 @@ func TestStartingBlockHeaderCachesStoredHeader(t *testing.T) {
 	synchronizer := sync.New(
 		bc,
 		dataSource,
+		gw,
 		log.NewNopZapLogger(),
-		time.Duration(0),
-		false,
-		testDB,
+		sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
 	)
 
 	storedStartingBlock := make(chan struct{}, 1)
@@ -299,10 +275,10 @@ func TestStartingBlockHeaderNotRunning(t *testing.T) {
 	synchronizer := sync.New(
 		bc,
 		newTestBlockDataSource(),
+		nil,
 		log.NewNopZapLogger(),
-		time.Duration(0),
-		true,
-		testDB,
+		sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
+		sync.WithReadOnlyBlockchain(true),
 	)
 
 	header, err := synchronizer.StartingBlockHeader()
@@ -324,10 +300,10 @@ func TestStartingBlockHeaderFallbackUnavailable(t *testing.T) {
 	synchronizer := sync.New(
 		bc,
 		dataSource,
+		nil,
 		log.NewNopZapLogger(),
-		time.Duration(0),
-		true,
-		testDB,
+		sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
+		sync.WithReadOnlyBlockchain(true),
 	)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -363,7 +339,13 @@ func TestReorg(t *testing.T) {
 		blockchain.WithNewState(statetestutils.UseNewState()),
 	)
 	dataSource := sync.NewFeederGatewayDataSource(bc, sepoliaGw)
-	synchronizer := sync.New(bc, dataSource, log.NewNopZapLogger(), 0, false, testDB)
+	synchronizer := sync.New(
+		bc,
+		dataSource,
+		sepoliaGw,
+		log.NewNopZapLogger(),
+		sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
+	)
 
 	ctx, cancel := context.WithTimeout(t.Context(), timeout)
 	require.NoError(t, synchronizer.Run(ctx))
@@ -385,7 +367,13 @@ func TestReorg(t *testing.T) {
 		require.NoError(t, err)
 
 		dataSource := sync.NewFeederGatewayDataSource(bc, mainGw)
-		synchronizer = sync.New(bc, dataSource, log.NewNopZapLogger(), 0, false, testDB)
+		synchronizer = sync.New(
+			bc,
+			dataSource,
+			mainGw,
+			log.NewNopZapLogger(),
+			sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
+		)
 		sub := synchronizer.SubscribeReorg()
 		// Use a generous timeout with early cancellation once the expected block is stored.
 		// The reorg flow (detect mismatch → revert → re-sync 3 blocks) needs more than 1s on slow CI.
@@ -436,7 +424,9 @@ func TestSubscribeNewHeads(t *testing.T) {
 	feeder := feeder.NewTestClient(t, &network)
 	gw := adaptfeeder.New(feeder)
 	dataSource := sync.NewFeederGatewayDataSource(chain, gw)
-	syncer := sync.New(chain, dataSource, logger, 0, false, testDB)
+	syncer := sync.New(
+		chain, dataSource, gw, logger, sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
+	)
 
 	sub := syncer.SubscribeNewHeads()
 
@@ -446,10 +436,9 @@ func TestSubscribeNewHeads(t *testing.T) {
 	cancel()
 	got, ok := <-sub.Recv()
 	require.True(t, ok)
-	want, err := gw.BlockByNumber(t.Context(), 0)
-	require.NoError(t, err)
+	want := adaptfeedertest.Block(t, feeder, 0)
 
-	require.Equal(t, want, got)
+	require.Equal(t, want, got.Value)
 	sub.Unsubscribe()
 }
 
@@ -457,11 +446,10 @@ func TestPreConfirmed(t *testing.T) {
 	t.Parallel()
 	logger := log.NewNopZapLogger()
 	client := feeder.NewTestClient(t, &networks.Mainnet)
-	gw := adaptfeeder.New(client)
 
-	// The stored-snapshot fast path is covered by
-	// TestPreConfirmedChainReturnsStoredSnapshot (preconfirmed_chain_test.go),
-	// which fills the storage through Run's pre-confirmed poller.
+	// The stored-snapshot fast path is covered by the poller tests in
+	// sync/preconfirmed/poller_test.go, which fill the chain through Run's
+	// pre-confirmed poller and read it back with RequestPreConfirmedChain.
 
 	t.Run("Returns empty pre_confirmed when nothing stored", func(t *testing.T) {
 		t.Parallel()
@@ -471,17 +459,23 @@ func TestPreConfirmed(t *testing.T) {
 			&networks.Mainnet,
 			blockchain.WithNewState(statetestutils.UseNewState()),
 		)
-		b0, err := gw.BlockByNumber(t.Context(), 0)
-		require.NoError(t, err)
-		s0, err := gw.StateUpdate(t.Context(), 0)
-		require.NoError(t, err)
-		require.NoError(t, bc.Store(b0, &core.BlockCommitments{}, s0, nil))
+		b0 := adaptfeedertest.Block(t, client, 0)
+		s0 := adaptfeedertest.StateUpdate(t, client, 0)
+		require.NoError(t, bc.Store(
+			b0,
+			&core.BlockCommitments{},
+			s0,
+			nil,
+			core.EventsBloom(b0.Receipts),
+		))
 
-		synchronizer := sync.New(bc, nil, logger, 0, false, testDB)
+		synchronizer := sync.New(
+			bc, nil, nil, logger, sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
+		)
 		head, err := bc.HeadsHeader()
 		require.NoError(t, err)
 
-		result, err := synchronizer.PreConfirmedChain()
+		result, err := synchronizer.RequestPreConfirmedChain()
 		require.NoError(t, err)
 		require.Equal(t, 1, result.Length())
 		tip := result.Head()

@@ -1,7 +1,8 @@
 package rpcv9
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 
@@ -62,7 +63,7 @@ func (b *blockIDType) String() string {
 	case number:
 		return "number"
 	default:
-		panic(fmt.Sprintf("Unknown blockIdType: %d", b))
+		panic(fmt.Sprintf("Unknown blockIdType: %d", *b))
 	}
 }
 
@@ -148,37 +149,42 @@ func (b *BlockID) Number() uint64 {
 	return b.data[0]
 }
 
-func (b *BlockID) UnmarshalJSON(data []byte) error {
-	var blockTag string
-	if err := json.Unmarshal(data, &blockTag); err == nil {
-		switch blockTag {
-		case "latest":
-			b.typeID = latest
-		case "pre_confirmed":
-			b.typeID = preConfirmed
-		case "l1_accepted":
-			b.typeID = l1Accepted
-		default:
-			return fmt.Errorf("unknown block tag '%s'", blockTag)
+// UnmarshalJSONFrom reads a block tag string or an object with a block hash or number.
+func (b *BlockID) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if dec.PeekKind() != '"' {
+		var object struct {
+			BlockHash   *felt.Felt `json:"block_hash"`
+			BlockNumber *uint64    `json:"block_number"`
 		}
-	} else {
-		jsonObject := make(map[string]json.RawMessage)
-		if err := json.Unmarshal(data, &jsonObject); err != nil {
+		if err := json.UnmarshalDecode(dec, &object); err != nil {
 			return err
 		}
-		blockHash, ok := jsonObject["block_hash"]
-		if ok {
+		switch {
+		case object.BlockHash != nil:
 			b.typeID = hash
-			return json.Unmarshal(blockHash, &b.data)
-		}
-
-		blockNumber, ok := jsonObject["block_number"]
-		if ok {
+			b.data = *object.BlockHash
+		case object.BlockNumber != nil:
 			b.typeID = number
-			return json.Unmarshal(blockNumber, &b.data[0])
+			b.data = felt.Felt([4]uint64{*object.BlockNumber, 0, 0, 0})
+		default:
+			return errors.New("cannot unmarshal block id")
 		}
+		return nil
+	}
 
-		return errors.New("cannot unmarshal block id")
+	blockTag, err := dec.ReadToken()
+	if err != nil {
+		return err
+	}
+	switch blockTag.String() {
+	case "latest":
+		b.typeID = latest
+	case "pre_confirmed":
+		b.typeID = preConfirmed
+	case "l1_accepted":
+		b.typeID = l1Accepted
+	default:
+		return fmt.Errorf("unknown block tag '%s'", blockTag.String())
 	}
 	return nil
 }
@@ -290,7 +296,7 @@ func (h *Handler) BlockTransactionCount(id *BlockID) (uint64, *jsonrpc.Error) {
 	switch id.Type() {
 	case preConfirmed:
 		var chain preconfirmed.ChainReader
-		chain, err = h.syncReader.PreConfirmedChain()
+		chain, err = h.syncReader.RequestPreConfirmedChain()
 		if err == nil {
 			count = chain.Head().Block.Header.TransactionCount
 		}
@@ -333,7 +339,7 @@ func (h *Handler) BlockTransactionCount(id *BlockID) (uint64, *jsonrpc.Error) {
 // https://github.com/starkware-libs/starknet-specs/blob/9377851884da5c81f757b6ae0ed47e84f9e7c058/api/starknet_api_openrpc.json#L25
 func (h *Handler) BlockWithTxHashes(id *BlockID) (*BlockWithTxHashes, *jsonrpc.Error) {
 	if id.IsPreConfirmed() {
-		preConfirmedChain, err := h.syncReader.PreConfirmedChain()
+		preConfirmedChain, err := h.syncReader.RequestPreConfirmedChain()
 		if err != nil {
 			if errors.Is(err, db.ErrKeyNotFound) || errors.Is(err, pending.ErrPreConfirmedNotFound) {
 				return nil, rpccore.ErrBlockNotFound
@@ -438,7 +444,7 @@ func (h *Handler) BlockWithReceipts(id *BlockID) (*BlockWithReceipts, *jsonrpc.E
 // https://github.com/starkware-libs/starknet-specs/blob/9377851884da5c81f757b6ae0ed47e84f9e7c058/api/starknet_api_openrpc.json#L62
 func (h *Handler) BlockWithTxs(blockID *BlockID) (*BlockWithTxs, *jsonrpc.Error) {
 	if blockID.IsPreConfirmed() {
-		preConfirmedChain, err := h.syncReader.PreConfirmedChain()
+		preConfirmedChain, err := h.syncReader.RequestPreConfirmedChain()
 		if err != nil {
 			if errors.Is(err, db.ErrKeyNotFound) || errors.Is(err, pending.ErrPreConfirmedNotFound) {
 				return nil, rpccore.ErrBlockNotFound

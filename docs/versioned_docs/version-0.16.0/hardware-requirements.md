@@ -1,8 +1,9 @@
 ---
 title: Hardware Requirements
+description: "CPU, memory and storage needed to run Juno, for validators and dApps or as a high-traffic RPC provider."
 ---
 
-# Hardware Requirements :computer:
+# Hardware Requirements
 
 Juno can be used either as part of a **validator** setup during Starknet staking v2 ([read more](https://nethermindeth.github.io/starknet-staking-v2/)) or as a **full node** serving RPC requests. Hardware requirements will vary depending on the intended usage.
 

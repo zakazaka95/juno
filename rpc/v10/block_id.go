@@ -1,7 +1,8 @@
 package rpcv10
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 
@@ -33,6 +34,22 @@ func (s BlockStatus) MarshalText() ([]byte, error) {
 	}
 }
 
+func (s *BlockStatus) UnmarshalText(text []byte) error {
+	switch string(text) {
+	case "PRE_CONFIRMED":
+		*s = BlockPreConfirmed
+	case "ACCEPTED_ON_L2":
+		*s = BlockAcceptedL2
+	case "ACCEPTED_ON_L1":
+		*s = BlockAcceptedL1
+	case "REJECTED":
+		*s = BlockRejected
+	default:
+		return fmt.Errorf("unknown block status %q", string(text))
+	}
+	return nil
+}
+
 type blockIDType uint8
 
 const (
@@ -56,7 +73,7 @@ func (b *blockIDType) String() string {
 	case number:
 		return "number"
 	default:
-		panic(fmt.Sprintf("Unknown blockIdType: %d", b))
+		panic(fmt.Sprintf("Unknown blockIdType: %d", *b))
 	}
 }
 
@@ -136,37 +153,63 @@ func (b *BlockID) Number() uint64 {
 	return b.data[0]
 }
 
-func (b *BlockID) UnmarshalJSON(data []byte) error {
-	var blockTag string
-	if err := json.Unmarshal(data, &blockTag); err == nil {
-		switch blockTag {
-		case "latest":
-			b.typeID = latest
-		case "pre_confirmed":
-			b.typeID = preConfirmed
-		case "l1_accepted":
-			b.typeID = l1Accepted
-		default:
-			return fmt.Errorf("unknown block tag '%s'", blockTag)
+func (b BlockID) MarshalJSONTo(enc *jsontext.Encoder) error {
+	switch b.typeID {
+	case latest:
+		return enc.WriteToken(jsontext.String("latest"))
+	case preConfirmed:
+		return enc.WriteToken(jsontext.String("pre_confirmed"))
+	case l1Accepted:
+		return enc.WriteToken(jsontext.String("l1_accepted"))
+	case hash:
+		return json.MarshalEncode(enc, struct {
+			BlockHash *felt.Felt `json:"block_hash"`
+		}{BlockHash: &b.data})
+	case number:
+		return json.MarshalEncode(enc, struct {
+			BlockNumber uint64 `json:"block_number"`
+		}{BlockNumber: b.data[0]})
+	default:
+		return fmt.Errorf("cannot marshal block id of type %d", b.typeID)
+	}
+}
+
+// UnmarshalJSONFrom reads a block tag string or an object with a block hash or number.
+func (b *BlockID) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if dec.PeekKind() != '"' {
+		var object struct {
+			BlockHash   *felt.Felt `json:"block_hash"`
+			BlockNumber *uint64    `json:"block_number"`
 		}
-	} else {
-		jsonObject := make(map[string]json.RawMessage)
-		if err := json.Unmarshal(data, &jsonObject); err != nil {
+		if err := json.UnmarshalDecode(dec, &object); err != nil {
 			return err
 		}
-		blockHash, ok := jsonObject["block_hash"]
-		if ok {
+		switch {
+		case object.BlockHash != nil:
 			b.typeID = hash
-			return json.Unmarshal(blockHash, &b.data)
-		}
-
-		blockNumber, ok := jsonObject["block_number"]
-		if ok {
+			b.data = *object.BlockHash
+		case object.BlockNumber != nil:
 			b.typeID = number
-			return json.Unmarshal(blockNumber, &b.data[0])
+			b.data = felt.Felt([4]uint64{*object.BlockNumber, 0, 0, 0})
+		default:
+			return errors.New("cannot unmarshal block id")
 		}
+		return nil
+	}
 
-		return errors.New("cannot unmarshal block id")
+	blockTag, err := dec.ReadToken()
+	if err != nil {
+		return err
+	}
+	switch blockTag.String() {
+	case "latest":
+		b.typeID = latest
+	case "pre_confirmed":
+		b.typeID = preConfirmed
+	case "l1_accepted":
+		b.typeID = l1Accepted
+	default:
+		return fmt.Errorf("unknown block tag '%s'", blockTag.String())
 	}
 	return nil
 }

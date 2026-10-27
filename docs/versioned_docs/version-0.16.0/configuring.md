@@ -1,8 +1,9 @@
 ---
 title: Configuration
+description: "Juno's configuration options, settable by flag, environment variable, or YAML file, with defaults."
 ---
 
-# Configuring Juno :gear:
+# Configuring Juno
 
 Juno can be configured using several methods, with the following order of precedence:
 

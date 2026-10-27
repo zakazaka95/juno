@@ -4,11 +4,13 @@ import (
 	"maps"
 	"testing"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder"
+	"github.com/NethermindEth/juno/adapters/adaptfeeder/adaptfeedertest"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
 	"github.com/NethermindEth/juno/core"
 	"github.com/NethermindEth/juno/core/felt"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
+	"github.com/NethermindEth/juno/db"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -120,6 +122,40 @@ func TestNonce(t *testing.T) {
 	})
 }
 
+func TestContractMetadata(t *testing.T) {
+	stateUpdates := getStateUpdates(t)
+	stateDB := setupState(t, stateUpdates, 2)
+	root := *stateUpdates[1].NewRoot
+
+	reader, err := NewStateReader(&root, stateDB)
+	require.NoError(t, err)
+
+	addr := &su1FirstDeployedAddress
+	classHash, nonce, storageRoot, err := reader.ContractMetadata(addr)
+	require.NoError(t, err)
+
+	expectedClassHash, err := reader.ContractClassHash(addr)
+	require.NoError(t, err)
+	assert.Equal(t, expectedClassHash, classHash)
+
+	expectedNonce, err := reader.ContractNonce(addr)
+	require.NoError(t, err)
+	assert.Equal(t, expectedNonce, nonce)
+
+	storageTrie, err := reader.ContractStorageTrie(addr)
+	require.NoError(t, err)
+	expectedStorageRoot, err := storageTrie.Hash()
+	require.NoError(t, err)
+	assert.Equal(t, expectedStorageRoot, storageRoot)
+
+	missing := felt.NewUnsafeFromString[felt.Felt]("0xdeadbeef")
+	missingClassHash, missingNonce, missingStorageRoot, err := reader.ContractMetadata(missing)
+	assert.ErrorIs(t, err, db.ErrKeyNotFound)
+	assert.True(t, missingClassHash.IsZero())
+	assert.True(t, missingNonce.IsZero())
+	assert.True(t, missingStorageRoot.IsZero())
+}
+
 func TestClass(t *testing.T) {
 	stateDB := setupState(t, nil, 0)
 
@@ -141,8 +177,7 @@ func TestClass(t *testing.T) {
 	state, err := New(&felt.Zero, stateDB, batch)
 	require.NoError(t, err)
 
-	su0, err := gw.StateUpdate(t.Context(), 0)
-	require.NoError(t, err)
+	su0 := adaptfeedertest.StateUpdate(t, client, 0)
 	require.NoError(t, state.Update(&core.Header{Number: 0}, su0, map[felt.Felt]core.ClassDefinition{
 		*deprecatedCairoHash: deprecatedCairoClass,
 		*sierraHash:          sierraClass,

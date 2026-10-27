@@ -1,8 +1,9 @@
 ---
 title: Hardware Requirements
+description: "CPU, memory and storage needed to run Juno, for validators and dApps or as a high-traffic RPC provider."
 ---
 
-# Hardware Requirements :computer:
+# Hardware Requirements
 
 Juno can be used either as part of a **validator** setup during Starknet staking v2 ([read more](https://nethermindeth.github.io/starknet-staking-v2/)) or as a **full node** serving RPC requests. Hardware requirements will vary depending on the intended usage.
 
@@ -41,7 +42,7 @@ These requirements are a good baseline and should be adjusted to the node's domi
 - **Increase CPU** if re-executing many transactions / blocks or compiling new Cairo classes.
 - **Increase memory** if you want to hold a bigger chunk of the database in memory and minimize latency when fetching historical data.
 
-See [Tuning](tuning) for more information on how to control the resource usage of your Juno node.
+See [Database](tuning) and [Contract Compilation](contract-compilation) for more information on how to control the resource usage of your Juno node.
 
 :::tip
 We intend the above specifications as a guideline. You should set the hardware requirements that fit best for your usage. If unsure, feel free to [reach the team](https://juno.nethermind.io/#community-and-support)!

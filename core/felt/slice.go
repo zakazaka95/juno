@@ -10,7 +10,8 @@ import (
 	"math"
 	"slices"
 
-	"github.com/fxamacker/cbor/v2"
+	"github.com/NethermindEth/juno/utils/cbor"
+	"github.com/consensys/gnark-crypto/ecc/stark-curve/fp"
 )
 
 type Slice[F FeltLike] []F
@@ -18,8 +19,8 @@ type Slice[F FeltLike] []F
 var (
 	_ json.MarshalerTo     = Slice[Felt]{}
 	_ json.UnmarshalerFrom = (*Slice[Felt])(nil)
-	_ cbor.Marshaler       = Slice[Felt]{}
-	_ cbor.Unmarshaler     = (*Slice[Felt])(nil)
+	_ cbor.SelfEncoder     = Slice[Felt]{}
+	_ cbor.SelfDecoder     = (*Slice[Felt])(nil)
 )
 
 const (
@@ -161,16 +162,13 @@ func (s Slice[F]) MarshalJSONTo(enc *jsontext.Encoder) error {
 	maxSize := len(s)*(MaxFeltAsHexSize+len(`"",`)) + len("[]") - len(",")
 	data := make([]byte, 1, maxSize)
 
-	var err error
 	data[0] = '['
 	for index := range s {
 		if index > 0 {
 			data = append(data, ',')
 		}
 		data = append(data, '"')
-		if data, err = Felt(s[index]).AppendText(data); err != nil {
-			return err
-		}
+		data = appendHex(data, fp.Element(s[index]))
 		data = append(data, '"')
 	}
 	data = append(data, ']')
@@ -229,13 +227,12 @@ func (s *Slice[F]) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		}
 		end := index + 1 + relativeEnd
 
-		var newFelt F
-		hexErr := asFeltPtr(&newFelt).setHex(val[index+1 : end])
-		if hexErr != nil {
+		var element fp.Element
+		if hexErr := setHex(&element, val[index+1:end]); hexErr != nil {
 			return hexErr
 		}
 
-		newSlice = append(newSlice, newFelt)
+		newSlice = append(newSlice, F(element))
 
 		index = end + 1
 	}

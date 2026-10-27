@@ -9,7 +9,7 @@ import (
 	"github.com/NethermindEth/juno/core"
 	"github.com/NethermindEth/juno/core/felt"
 	"github.com/NethermindEth/juno/db/memory"
-	_ "github.com/NethermindEth/juno/encoder/registry"
+	_ "github.com/NethermindEth/juno/utils/cbor/registry"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/stretchr/testify/require"
 )
@@ -46,4 +46,10 @@ func TestMigrateIfNeeded_WrapsPruneFetchError(t *testing.T) {
 	}
 	err := migrateIfNeeded(t.Context(), memory.New(), cfg, nil, log.NewNopZapLogger())
 	require.ErrorContains(t, err, "fetching L1 head for pruning")
+}
+
+func TestMigrateIfNeeded_SkipsMigrationsForRemoteDB(t *testing.T) {
+	cfg := &Config{RemoteDB: "localhost:6064"}
+	err := migrateIfNeeded(t.Context(), memory.New(), cfg, nil, log.NewNopZapLogger())
+	require.NoError(t, err)
 }
