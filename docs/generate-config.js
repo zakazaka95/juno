@@ -1,5 +1,5 @@
 const fs = require("fs");
-const https = require("https");
+const path = require("path");
 
 function preprocessCodebase(codebase) {
   // Split the codebase into lines
@@ -225,6 +225,15 @@ function parseValue(value) {
   if (value === "vm.DefaultMaxSteps") return 4_000_000;
   if (value === "vm.DefaultMaxGas") return 100_000_000;
 
+  // sync/preconfirmed/option.go: const DefaultPollInterval = time.Second
+  if (value === "preconfirmed.DefaultPollInterval") return "1s";
+
+  // sync/preconfirmed/option.go: const DefaultStaleAfter = 250 * time.Millisecond
+  if (value === "preconfirmed.DefaultStaleAfter") return "250ms";
+
+  // sync/preconfirmed/option.go: const DefaultOnDemandWait = 300 * time.Millisecond
+  if (value === "preconfirmed.DefaultOnDemandWait") return "300ms";
+
   // Strip uint64(...) / uint(...) type casts so e.g. `uint64(0)` becomes `0`.
   const uintCast = value.match(/^uint(?:8|16|32|64)?\((.+)\)$/);
   if (uintCast) {
@@ -276,44 +285,21 @@ function generateConfigTable(configs) {
   });
 
   const fileWarning =
-    "<!-- This file is generated automatically. Any manual modifications will be overwritten. -->\n\n";
+    "{/* This file is generated automatically. Any manual modifications will be overwritten. */}\n\n";
   fs.writeFileSync(
-    "docs/_config-options.md",
+    path.join(__dirname, "docs", "_config-options.md"),
     fileWarning + sections.join("\n"),
   );
 }
 
-function fetchUrl(url) {
-  return new Promise((resolve, reject) => {
-    https
-      .get(url, (res) => {
-        if (res.statusCode !== 200) {
-          reject(new Error(`HTTP status ${res.statusCode}`));
-          res.resume(); // Consume response data to free up memory
-          return;
-        }
+// Read the flags from this checkout, not from remote main, so the generated
+// table always describes the commit it ships with.
+const SOURCE = path.join(__dirname, "..", "cmd", "juno", "juno.go");
 
-        res.setEncoding("utf8");
-        let rawData = "";
-        res.on("data", (chunk) => {
-          rawData += chunk;
-        });
-        res.on("end", () => {
-          resolve(rawData);
-        });
-      })
-      .on("error", (e) => {
-        reject(e);
-      });
-  });
-}
-
-async function main() {
+function main() {
   try {
-    const url =
-      "https://raw.githubusercontent.com/NethermindEth/juno/main/cmd/juno/juno.go";
-    const codebase = await fetchUrl(url);
-    console.log("Fetched Juno's source code");
+    const codebase = fs.readFileSync(SOURCE, "utf8");
+    console.log("Read Juno's configuration from the checkout");
 
     const preprocessedCode = preprocessCodebase(codebase);
     const configs = extractConfigs(preprocessedCode);
@@ -322,10 +308,8 @@ async function main() {
     generateConfigTable(configs);
     console.log("Generated the configuration options table");
   } catch (error) {
-    console.error(
-      "An error occurred while generating the config: ",
-      error.message,
-    );
+    console.error("Failed to generate the config table:", error.message);
+    process.exitCode = 1;
   }
 }
 

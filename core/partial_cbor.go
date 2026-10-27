@@ -4,7 +4,7 @@ import (
 	"errors"
 
 	"github.com/NethermindEth/juno/core/felt"
-	bloom "github.com/bits-and-blooms/bloom/v3"
+	"github.com/NethermindEth/juno/utils/cbor"
 )
 
 // discardedCBOR is a no-op unmarshaler for fields a partial projection does not want.
@@ -19,6 +19,11 @@ type discardedCBOR struct{}
 // errDiscardedCBORMarshal is returned when a decode-only projection is marshaled.
 var errDiscardedCBORMarshal = errors.New(
 	"core: partial CBOR projection is decode-only and must not be marshaled",
+)
+
+var (
+	_ cbor.SelfEncoder = discardedCBOR{}
+	_ cbor.SelfDecoder = discardedCBOR{}
 )
 
 func (discardedCBOR) UnmarshalCBOR([]byte) error { return nil }
@@ -43,7 +48,6 @@ type discardedHeaderSkeleton struct {
 	EventCount       discardedCBOR
 	Timestamp        discardedCBOR
 	ProtocolVersion  discardedCBOR
-	EventsBloom      discardedCBOR
 	L1GasPriceETH    discardedCBOR `cbor:"gasprice"`
 	Signatures       discardedCBOR
 	L1GasPriceSTRK   discardedCBOR `cbor:"gaspricestrk"`
@@ -70,11 +74,6 @@ type headerTransactionCountProjection struct {
 type headerTimestampProjection struct {
 	discardedHeaderSkeleton
 	Timestamp *uint64
-}
-
-type headerEventsBloomProjection struct {
-	discardedHeaderSkeleton
-	EventsBloom *bloom.BloomFilter
 }
 
 type headerHashAndStateRootProjection struct {

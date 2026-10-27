@@ -3,6 +3,7 @@ package rpcv9
 import (
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 
@@ -55,10 +56,9 @@ func (b *SubscriptionBlockID) Number() uint64 {
 	return (*BlockID)(b).Number()
 }
 
-func (b *SubscriptionBlockID) UnmarshalJSON(data []byte) error {
+func (b *SubscriptionBlockID) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	blockID := (*BlockID)(b)
-	err := blockID.UnmarshalJSON(data)
-	if err != nil {
+	if err := blockID.UnmarshalJSONFrom(dec); err != nil {
 		return err
 	}
 
@@ -85,8 +85,8 @@ type on[T any] func(ctx context.Context, id string, sub *subscription, event T) 
 type subscriber struct {
 	onStart               on[any]
 	onReorg               on[*sync.ReorgBlockRange]
-	onNewHead             on[*core.Block]
-	onPreConfirmed        on[*pending.PreConfirmed]
+	onNewHead             on[*core.WithBloom[*core.Block]]
+	onPreConfirmed        on[*core.WithBloom[*pending.PreConfirmed]]
 	onL1Head              on[*core.L1Head]
 	onReceivedTransaction on[core.Transaction]
 }

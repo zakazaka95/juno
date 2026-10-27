@@ -1,12 +1,15 @@
 package statebackend
 
 import (
+	"errors"
+
 	"github.com/NethermindEth/juno/core"
 	"github.com/NethermindEth/juno/core/deprecatedstate"
 	"github.com/NethermindEth/juno/core/felt"
 	"github.com/NethermindEth/juno/db"
 	"github.com/NethermindEth/juno/db/memory"
 	"github.com/NethermindEth/juno/pruner"
+	"github.com/bits-and-blooms/bloom/v3"
 )
 
 type deprecatedStateBackend struct {
@@ -20,10 +23,12 @@ func (b *deprecatedStateBackend) HeadState() (core.StateReader, StateCloser, err
 	// Fail early if no block has been committed (no head state to open)
 	// only the key's existence matters, not the height itself.
 	if _, err := core.GetChainHeight(txn); err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Join(err, txn.Close())
 	}
 
-	return deprecatedstate.New(txn), NoopStateCloser, nil
+	// The batch has to be closed: on a remote DB it is a gRPC stream, and the
+	// server holds a batch of its own open for as long as the stream lives.
+	return deprecatedstate.New(txn), txn.Close, nil
 }
 
 func (b *deprecatedStateBackend) StateAtBlockNumber(
@@ -38,7 +43,7 @@ func (b *deprecatedStateBackend) StateAtBlockNumber(
 	return deprecatedstate.NewHistory(
 		deprecatedstate.New(txn),
 		blockNumber,
-	), NoopStateCloser, nil
+	), txn.Close, nil
 }
 
 func (b *deprecatedStateBackend) StateAtBlockHash(
@@ -48,7 +53,7 @@ func (b *deprecatedStateBackend) StateAtBlockHash(
 	if blockHash.IsZero() {
 		memDB := memory.New()
 		txn := memDB.NewIndexedBatch()
-		return deprecatedstate.New(txn), NoopStateCloser, nil
+		return deprecatedstate.New(txn), txn.Close, nil
 	}
 
 	blockNumber, err := pruner.BlockNumberByHashIfStateRetained(b.database, blockHash)
@@ -60,7 +65,32 @@ func (b *deprecatedStateBackend) StateAtBlockHash(
 	return deprecatedstate.NewHistory(
 		deprecatedstate.New(txn),
 		blockNumber,
-	), NoopStateCloser, nil
+	), txn.Close, nil
+}
+
+func (b *deprecatedStateBackend) TrieStateAtBlockNumber(
+	blockNumber uint64,
+) (core.StateReader, StateCloser, error) {
+	err := pruner.RequireStateRetainedByBlockNumber(
+		b.database,
+		b.retentionFloor,
+		blockNumber,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	//nolint:staticcheck,nolintlint // used by old state
+	txn := b.database.NewIndexedBatch()
+	height, err := core.GetChainHeight(txn)
+	if err != nil {
+		return nil, nil, err
+	}
+	if height != blockNumber {
+		return nil, nil, db.ErrKeyNotFound
+	}
+
+	return deprecatedstate.New(txn), NoopStateCloser, nil
 }
 
 func (b *deprecatedStateBackend) Store(
@@ -68,6 +98,7 @@ func (b *deprecatedStateBackend) Store(
 	blockCommitments *core.BlockCommitments,
 	stateUpdate *core.StateUpdate,
 	newClasses map[felt.Felt]core.ClassDefinition,
+	eventsBloom *bloom.BloomFilter,
 ) error {
 	//nolint:staticcheck,nolintlint // used by old state
 	return b.database.Update(func(txn db.IndexedBatch) error {
@@ -97,7 +128,7 @@ func (b *deprecatedStateBackend) Store(
 			return err
 		}
 
-		return b.runningFilter.InsertWithBatch(txn, block.EventsBloom, block.Number)
+		return b.runningFilter.InsertWithBatch(txn, eventsBloom, block.Number)
 	})
 }
 
@@ -134,6 +165,8 @@ func (b *deprecatedStateBackend) RevertHead() error {
 func (b *deprecatedStateBackend) GetReverseStateDiff() (core.StateDiff, error) {
 	//nolint:staticcheck,nolintlint // used by old state
 	txn := b.database.NewIndexedBatch()
+	defer txn.Close()
+
 	blockNum, err := core.GetChainHeight(txn)
 	if err != nil {
 		return core.StateDiff{}, err
@@ -198,6 +231,7 @@ func (b *deprecatedStateBackend) Finalise(
 	stateUpdate *core.StateUpdate,
 	newClasses map[felt.Felt]core.ClassDefinition,
 	sign core.BlockSignFunc,
+	eventsBloom *bloom.BloomFilter,
 ) error {
 	//nolint:staticcheck,nolintlint // used by old state
 	return b.database.Update(func(txn db.IndexedBatch) error {
@@ -231,7 +265,7 @@ func (b *deprecatedStateBackend) Finalise(
 			return err
 		}
 
-		return b.runningFilter.InsertWithBatch(txn, block.EventsBloom, block.Number)
+		return b.runningFilter.InsertWithBatch(txn, eventsBloom, block.Number)
 	})
 }
 

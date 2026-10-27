@@ -1,10 +1,11 @@
 package rpcv9_test
 
 import (
+	"encoding/json"
 	"errors"
-	"fmt"
 	"testing"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder/adaptfeedertest"
 	"github.com/NethermindEth/juno/blockchain"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
@@ -17,7 +18,6 @@ import (
 	"github.com/NethermindEth/juno/mocks"
 	"github.com/NethermindEth/juno/rpc/rpccore"
 	rpc "github.com/NethermindEth/juno/rpc/v9"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/stretchr/testify/assert"
@@ -66,7 +66,8 @@ func TestBlockIDMarshalling(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			var blockID rpc.BlockID
-			require.NoError(t, blockID.UnmarshalJSON([]byte(test.blockIDJSON)))
+			//nolint:staticcheck,nolintlint // SA9005 does not know json/v2 UnmarshalJSONFrom
+			require.NoError(t, json.Unmarshal([]byte(test.blockIDJSON), &blockID))
 			assert.True(t, test.checkFunc(&blockID))
 		})
 	}
@@ -94,7 +95,8 @@ func TestBlockIDMarshalling(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			var blockID rpc.BlockID
-			assert.Error(t, blockID.UnmarshalJSON([]byte(test.blockIDJSON)))
+			//nolint:staticcheck,nolintlint // SA9005 does not know json/v2 UnmarshalJSONFrom
+			assert.Error(t, json.Unmarshal([]byte(test.blockIDJSON), &blockID))
 		})
 	}
 }
@@ -143,10 +145,8 @@ func TestBlockHashAndNumber(t *testing.T) {
 
 	t.Run("blockchain height is 147", func(t *testing.T) {
 		client := feeder.NewTestClient(t, n)
-		gw := adaptfeeder.New(client)
 
-		expectedBlock, err := gw.BlockByNumber(t.Context(), 147)
-		require.NoError(t, err)
+		expectedBlock := adaptfeedertest.Block(t, client, 147)
 
 		expectedBlockHashAndNumber := &rpc.BlockHashAndNumber{
 			Hash:   expectedBlock.Hash,
@@ -171,12 +171,9 @@ func TestBlockTransactionCount(t *testing.T) {
 	handler := rpc.New(mockReader, mockSyncReader, nil, logger)
 
 	client := feeder.NewTestClient(t, n)
-	gw := adaptfeeder.New(client)
 
 	latestBlockNumber := uint64(56377)
-	latestBlock, err := gw.BlockByNumber(t.Context(), latestBlockNumber)
-
-	require.NoError(t, err)
+	latestBlock := adaptfeedertest.Block(t, client, latestBlockNumber)
 	latestBlockHash := latestBlock.Hash
 	expectedCount := latestBlock.TransactionCount
 
@@ -197,7 +194,8 @@ func TestBlockTransactionCount(t *testing.T) {
 	})
 
 	t.Run("non-existent pre_confirmed block", func(t *testing.T) {
-		mockSyncReader.EXPECT().PreConfirmedChain().Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound)
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().
+			Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound)
 		preConfirmed := blockIDPreConfirmed(t)
 		count, rpcErr := handler.BlockTransactionCount(&preConfirmed)
 		require.Equal(t, rpccore.ErrBlockNotFound, rpcErr)
@@ -279,7 +277,7 @@ func TestBlockTransactionCount(t *testing.T) {
 		latestBlock.Hash = nil
 		latestBlock.GlobalStateRoot = nil
 		preConfirmed := pending.NewPreConfirmed(latestBlock, nil, nil, "")
-		mockSyncReader.EXPECT().PreConfirmedChain().Return(mustNewChain(t, &preConfirmed), nil)
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().Return(mustNewChain(t, &preConfirmed), nil)
 
 		preConfirmedID := blockIDPreConfirmed(t)
 		count, rpcErr := handler.BlockTransactionCount(&preConfirmedID)
@@ -322,7 +320,7 @@ func TestBlockWithTxHashes(t *testing.T) {
 			if description == "pre_confirmed" {
 				mockSyncReader = mocks.NewMockSyncReader(mockCtrl)
 				mockSyncReader.EXPECT().
-					PreConfirmedChain().
+					RequestPreConfirmedChain().
 					Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound)
 			}
 
@@ -339,11 +337,9 @@ func TestBlockWithTxHashes(t *testing.T) {
 	handler := rpc.New(mockReader, mockSyncReader, nil, nil)
 
 	client := feeder.NewTestClient(t, n)
-	gw := adaptfeeder.New(client)
 
 	latestBlockNumber := uint64(56377)
-	latestBlock, err := gw.BlockByNumber(t.Context(), latestBlockNumber)
-	require.NoError(t, err)
+	latestBlock := adaptfeedertest.Block(t, client, latestBlockNumber)
 	latestBlockHash := latestBlock.Hash
 
 	checkBlock := func(t *testing.T, b *rpc.BlockWithTxHashes) {
@@ -469,7 +465,8 @@ func TestBlockWithTxHashes(t *testing.T) {
 		latestBlock.Hash = nil
 		latestBlock.GlobalStateRoot = nil
 		preConfirmed := pending.NewPreConfirmed(latestBlock, nil, nil, "")
-		mockSyncReader.EXPECT().PreConfirmedChain().Return(mustNewChain(t, &preConfirmed), nil).Times(1)
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().
+			Return(mustNewChain(t, &preConfirmed), nil).Times(1)
 
 		preConfirmedID := blockIDPreConfirmed(t)
 		block, rpcErr := handler.BlockWithTxHashes(&preConfirmedID)
@@ -542,7 +539,7 @@ func TestBlockWithTxs(t *testing.T) {
 			if description == "pre_confirmed" {
 				mockSyncReader = mocks.NewMockSyncReader(mockCtrl)
 				mockSyncReader.EXPECT().
-					PreConfirmedChain().
+					RequestPreConfirmedChain().
 					Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound)
 			}
 
@@ -559,11 +556,9 @@ func TestBlockWithTxs(t *testing.T) {
 
 	n := &networks.Mainnet
 	client := feeder.NewTestClient(t, n)
-	gw := adaptfeeder.New(client)
 
 	latestBlockNumber := uint64(16697)
-	latestBlock, err := gw.BlockByNumber(t.Context(), latestBlockNumber)
-	require.NoError(t, err)
+	latestBlock := adaptfeedertest.Block(t, client, latestBlockNumber)
 	latestBlockHash := latestBlock.Hash
 
 	checkLatestBlock := func(
@@ -588,18 +583,11 @@ func TestBlockWithTxs(t *testing.T) {
 		latestBlockTxMap[*tx.Hash()] = tx
 	}
 
-	preConfirmed := &pending.PreConfirmed{
-		Block: &core.Block{
-			Header: &core.Header{
-				Number: latestBlockNumber + 1,
-			},
-		},
-	}
-	mockSyncReader.EXPECT().
-		PreConfirmedChain().
-		Return(mustNewChain(t, preConfirmed), nil).
-		Times(len(latestBlock.Transactions) * 6)
-
+	// checkLatestBlock resolves every transaction through TransactionByHash, which
+	// misses the stored pre_confirmed chain and hits the finalised store, in all seven
+	// subtests below.
+	mockSyncReader.EXPECT().ReadPreConfirmedChain().Return(emptyPreConfirmedChain(t), nil).
+		Times(len(latestBlock.Transactions) * 7)
 	mockReader.EXPECT().TransactionByHash(gomock.Any()).DoAndReturn(
 		func(hash *felt.Felt) (core.Transaction, error) {
 			if tx, found := latestBlockTxMap[*hash]; found {
@@ -607,7 +595,7 @@ func TestBlockWithTxs(t *testing.T) {
 			}
 			return nil, errors.New("txn not found")
 		},
-	).Times(len(latestBlock.Transactions) * 6)
+	).Times(len(latestBlock.Transactions) * 7)
 
 	t.Run("blockID - latest", func(t *testing.T) {
 		mockReader.EXPECT().HeadsHeader().Return(latestBlock.Header, nil).Times(2)
@@ -751,10 +739,12 @@ func TestBlockWithTxs(t *testing.T) {
 		latestBlock.Hash = nil
 		latestBlock.GlobalStateRoot = nil
 		preConfirmed := pending.NewPreConfirmed(latestBlock, nil, nil, "")
+		// Only the two block handlers read the pre_confirmed chain; the
+		// per-transaction lookups in checkLatestBlock are served by the store.
 		mockSyncReader.EXPECT().
-			PreConfirmedChain().
+			RequestPreConfirmedChain().
 			Return(mustNewChain(t, &preConfirmed), nil).
-			Times(2 + len(latestBlock.Transactions))
+			Times(2)
 
 		preConfirmedID := blockIDPreConfirmed(t)
 		blockWithTxHashes, rpcErr := handler.BlockWithTxHashes(&preConfirmedID)
@@ -785,7 +775,7 @@ func TestBlockWithTxs(t *testing.T) {
 		baseEntry := pending.PreConfirmed{Block: &core.Block{Header: &baseHeader}}
 
 		// pre_confirmed handlers resolve the chain once each and never read the L1 head
-		mockSyncReader.EXPECT().PreConfirmedChain().
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().
 			Return(mustNewChain(t, &baseEntry, &tipEntry), nil).Times(2)
 
 		expectedHashes := make([]*felt.Felt, len(latestBlock.Transactions))
@@ -855,9 +845,8 @@ func TestBlockWithTxsV013(t *testing.T) {
 	handler := rpc.New(mockReader, nil, nil, nil)
 
 	blockNumber := uint64(16350)
-	gw := adaptfeeder.New(feeder.NewTestClient(t, n))
-	coreBlock, err := gw.BlockByNumber(t.Context(), blockNumber)
-	require.NoError(t, err)
+	client := feeder.NewTestClient(t, n)
+	coreBlock := adaptfeedertest.Block(t, client, blockNumber)
 	tx, ok := coreBlock.Transactions[0].(*core.InvokeTransaction)
 	require.True(t, ok)
 
@@ -964,18 +953,16 @@ func TestBlockWithReceipts(t *testing.T) {
 	})
 
 	client := feeder.NewTestClient(t, n)
-	mainnetGw := adaptfeeder.New(client)
 
 	t.Run("pre_confirmed block", func(t *testing.T) {
-		block0, err := mainnetGw.BlockByNumber(t.Context(), 0)
-		require.NoError(t, err)
+		block0 := adaptfeedertest.Block(t, client, 0)
 
 		// pre_confirmed block does not have, hash, parent_hash, global_state_root
 		block0.Hash = nil
 		block0.ParentHash = nil
 		block0.GlobalStateRoot = nil
 		preConfirmed := pending.NewPreConfirmed(block0, nil, nil, "")
-		mockSyncReader.EXPECT().PreConfirmedChain().Return(mustNewChain(t, &preConfirmed), nil)
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().Return(mustNewChain(t, &preConfirmed), nil)
 
 		blockID := blockIDPreConfirmed(t)
 		resp, rpcErr := handler.BlockWithReceipts(&blockID)
@@ -1015,8 +1002,7 @@ func TestBlockWithReceipts(t *testing.T) {
 	})
 
 	t.Run("blockID - l1_accepted bounded to chain height when L1 is ahead", func(t *testing.T) {
-		block1, err := mainnetGw.BlockByNumber(t.Context(), 1)
-		require.NoError(t, err)
+		block1 := adaptfeedertest.Block(t, client, 1)
 
 		mockReader.EXPECT().L1Head().Return(core.L1Head{
 			BlockNumber: block1.Number + 10,
@@ -1065,8 +1051,7 @@ func TestBlockWithReceipts(t *testing.T) {
 	})
 
 	t.Run("accepted L1 block", func(t *testing.T) {
-		block1, err := mainnetGw.BlockByNumber(t.Context(), 1)
-		require.NoError(t, err)
+		block1 := adaptfeedertest.Block(t, client, 1)
 
 		blockID := blockIDNumber(t, block1.Number)
 
@@ -1124,12 +1109,10 @@ func TestRpcBlockAdaptation(t *testing.T) {
 	handler := rpc.New(mockReader, nil, nil, nil)
 
 	client := feeder.NewTestClient(t, n)
-	gw := adaptfeeder.New(client)
 	latestBlockNumber := uint64(4850)
 
 	t.Run("default sequencer address", func(t *testing.T) {
-		latestBlock, err := gw.BlockByNumber(t.Context(), latestBlockNumber)
-		require.NoError(t, err)
+		latestBlock := adaptfeedertest.Block(t, client, latestBlockNumber)
 		latestBlock.Header.SequencerAddress = nil
 		mockReader.EXPECT().HeadsHeader().Return(latestBlock.Header, nil).Times(2)
 		mockReader.EXPECT().TransactionsByBlockNumber(latestBlock.Number).Return(
@@ -1140,58 +1123,36 @@ func TestRpcBlockAdaptation(t *testing.T) {
 
 		blockID := blockIDLatest(t)
 		block, rpcErr := handler.BlockWithTxs(&blockID)
-		require.NoError(t, err, rpcErr)
+		require.Nil(t, rpcErr)
 		require.Equal(t, &felt.Zero, block.BlockHeader.SequencerAddress)
 
 		blockWithTxHashes, rpcErr := handler.BlockWithTxHashes(&blockID)
-		require.NoError(t, err, rpcErr)
+		require.Nil(t, rpcErr)
 		require.Equal(t, &felt.Zero, blockWithTxHashes.BlockHeader.SequencerAddress)
 	})
 }
 
 func blockIDPreConfirmed(t *testing.T) rpc.BlockID {
 	t.Helper()
-
-	blockID := rpc.BlockID{}
-	require.NoError(t, blockID.UnmarshalJSON([]byte(`"pre_confirmed"`)))
-	return blockID
+	return rpc.BlockIDPreConfirmed()
 }
 
 func blockIDLatest(t *testing.T) rpc.BlockID {
 	t.Helper()
-
-	blockID := rpc.BlockID{}
-	require.NoError(t, blockID.UnmarshalJSON([]byte(`"latest"`)))
-	return blockID
+	return rpc.BlockIDLatest()
 }
 
 func blockIDHash(t *testing.T, val *felt.Felt) rpc.BlockID {
 	t.Helper()
-
-	blockID := rpc.BlockID{}
-	require.NoError(
-		t,
-		blockID.UnmarshalJSON(
-			[]byte(fmt.Sprintf(`{ "block_hash" : %q }`, val.String())),
-		),
-	)
-	return blockID
+	return rpc.BlockIDFromHash(val)
 }
 
 func blockIDNumber(t *testing.T, val uint64) rpc.BlockID {
 	t.Helper()
-
-	blockID := rpc.BlockID{}
-	require.NoError(t,
-		blockID.UnmarshalJSON([]byte(fmt.Sprintf(`{ "block_number" : %d}`, val))),
-	)
-	return blockID
+	return rpc.BlockIDFromNumber(val)
 }
 
 func blockIDL1Accepted(t *testing.T) rpc.BlockID {
 	t.Helper()
-
-	blockID := rpc.BlockID{}
-	require.NoError(t, blockID.UnmarshalJSON([]byte(`"l1_accepted"`)))
-	return blockID
+	return rpc.BlockIDL1Accepted()
 }

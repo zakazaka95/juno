@@ -3,6 +3,8 @@ package jsonrpc_test
 import (
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,18 +12,20 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 
 	"github.com/NethermindEth/juno/jsonrpc"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/go-playground/validator/v10"
 	"github.com/sourcegraph/conc"
+	"github.com/sourcegraph/conc/pool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
 )
 
 func TestServer_RegisterMethod(t *testing.T) {
-	server := jsonrpc.NewServer(1, log.NewNopZapLogger())
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger())
 	tests := map[string]struct {
 		handler    any
 		paramNames []jsonrpc.Parameter
@@ -89,6 +93,20 @@ func TestServer_RegisterMethod(t *testing.T) {
 	})
 }
 
+// rejectingParam fails in its unmarshal method, as rpc param types do on bad input
+type rejectingParam struct{}
+
+func (*rejectingParam) UnmarshalJSON([]byte) error {
+	return errors.New("unknown block tag 'foo'")
+}
+
+// caseClashParam has two names that differ only in case. v1 accepts a key that
+// matches both, while v2 rejects it as ambiguous.
+type caseClashParam struct {
+	Lower int `json:"foo"`
+	Upper int `json:"FOO"`
+}
+
 func TestHandle(t *testing.T) {
 	type validationStruct struct {
 		A int `validate:"min=1"`
@@ -104,6 +122,12 @@ func TestHandle(t *testing.T) {
 				return struct {
 					Doubled int `json:"doubled"`
 				}{*num * 2}, nil
+			},
+		},
+		{
+			Name: "nilResult",
+			Handler: func() (any, *jsonrpc.Error) {
+				return nil, nil
 			},
 		},
 		{
@@ -196,10 +220,27 @@ func TestHandle(t *testing.T) {
 				return 0, nil
 			},
 		},
+		{
+			Name:   "raw",
+			Params: []jsonrpc.Parameter{{Name: "param"}},
+			Handler: func(param jsontext.Value) (string, *jsonrpc.Error) {
+				return string(param), nil
+			},
+		},
+		{
+			Name:    "rejecting",
+			Params:  []jsonrpc.Parameter{{Name: "param"}},
+			Handler: func(param rejectingParam) (int, *jsonrpc.Error) { return 0, nil },
+		},
+		{
+			Name:    "caseClash",
+			Params:  []jsonrpc.Parameter{{Name: "param"}},
+			Handler: func(param caseClashParam) (int, *jsonrpc.Error) { return param.Lower + param.Upper, nil },
+		},
 	}
 
 	listener := CountingEventListener{}
-	server := jsonrpc.NewServer(1, log.NewNopZapLogger()).
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger()).
 		WithValidator(validator.New()).
 		WithListener(&listener)
 	require.NoError(t, server.RegisterMethods(methods...))
@@ -301,6 +342,66 @@ func TestHandle(t *testing.T) {
 		"notification": {
 			req: `{"jsonrpc" : "2.0", "method" : "method","params" : { "num" : 5, "shouldError" : false, "msg": "error message" }}`,
 			res: ``,
+		},
+		"null id is a request, not a notification": {
+			req: `{"jsonrpc":"2.0","method":"method","params":{"num":5},"id":null}`,
+			res: `{"jsonrpc":"2.0","result":{"doubled":10},"id":null}`,
+		},
+
+		"null id unknown method": {
+			req: `{"jsonrpc":"2.0","method":"absent","id":null}`,
+			res: `{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method Not Found"},"id":null}`,
+		},
+
+		"batch with null id and notification": {
+			req: `[{"jsonrpc":"2.0","method":"method","params":{"num":5},"id":null},
+					{"jsonrpc":"2.0","method":"method","params":{"num":5}}]`,
+			res: `[{"jsonrpc":"2.0","result":{"doubled":10},"id":null}]`,
+		},
+
+		"nil interface result keeps the result key": {
+			req: `{"jsonrpc":"2.0","method":"nilResult","id":1}`,
+			res: `{"jsonrpc":"2.0","result":null,"id":1}`,
+		},
+
+		"trailing whitespace": {
+			req: `{"jsonrpc":"2.0","method":"method","params":{"num":5},"id":1}` + "\n \t\r\n",
+			res: `{"jsonrpc":"2.0","result":{"doubled":10},"id":1}`,
+		},
+
+		"trailing garbage": {
+			req: `{"jsonrpc":"2.0","method":"method","params":{"num":5},"id":1} trailing`,
+			res: `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"{\"jsonrpc\":\"2.0\",\"method\":\"method\",\"params\":{\"num\":5},\"id\":1} trailing\n                                                              ^\nunexpected data after the request [line 1, position 63]"},"id":null}`,
+		},
+
+		"second request after the first": {
+			req: `{"jsonrpc":"2.0","method":"method","params":{"num":5},"id":1}{"jsonrpc":"2.0","method":"method","params":{"num":5},"id":2}`,
+			res: `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"...\":\"method\",\"params\":{\"num\":5},\"id\":1}{\"jsonrpc\":\"2.0\",\"method\":\"method\",\"p...\n                                        ^\nunexpected data after the request [line 1, position 62]"},"id":null}`,
+		},
+
+		"trailing garbage after batch": {
+			req: `[{"jsonrpc":"2.0","method":"method","params":{"num":5},"id":1}] ]`,
+			res: `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"[{\"jsonrpc\":\"2.0\",\"method\":\"method\",\"params\":{\"num\":5},\"id\":1}] ]\n                                                                ^\nunexpected data after the request [line 1, position 65]"},"id":null}`,
+		},
+
+		"unknown method notification": {
+			req: `{"jsonrpc":"2.0","method":"absent"}`,
+			res: ``,
+		},
+
+		"invalid params notification": {
+			req: `{"jsonrpc":"2.0","method":"method","params":{}}`,
+			res: ``,
+		},
+
+		"batch with failing notifications only": {
+			req: `[{"jsonrpc":"2.0","method":"absent"},{"jsonrpc":"2.0","method":"method","params":{}}]`,
+			res: ``,
+		},
+
+		"batch excludes failing notifications": {
+			req: `[{"jsonrpc":"2.0","method":"absent"},{"jsonrpc":"2.0","method":"method","params":{}},{"jsonrpc":"2.0","method":"method","params":{"num":5},"id":5}]`,
+			res: `[{"jsonrpc":"2.0","result":{"doubled":10},"id":5}]`,
 		},
 
 		"batch with notif and string id": {
@@ -540,6 +641,36 @@ func TestHandle(t *testing.T) {
 			res: `{"jsonrpc":"2.0","result":0,"id":1}`,
 		},
 
+		"null params": {
+			req: `{"jsonrpc": "2.0", "method": "singleOptionalParam", "params": null, "id": 1}`,
+			res: `{"jsonrpc":"2.0","result":0,"id":1}`,
+		},
+
+		"null params with a required param": {
+			req: `{"jsonrpc": "2.0", "method": "method", "params": null, "id": 1}`,
+			res: `{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid Params","data":"missing required params: num"},"id":1}`,
+		},
+
+		"positional param keeps its bytes": {
+			req: `{"jsonrpc": "2.0", "method": "raw", "params": [{"b":1,"a":2.50}], "id": 1}`,
+			res: `{"jsonrpc":"2.0","result":"{\"b\":1,\"a\":2.50}","id":1}`,
+		},
+
+		"named param keeps its bytes": {
+			req: `{"jsonrpc": "2.0", "method": "raw", "params": {"param": {"b":1,"a":2.50}}, "id": 1}`,
+			res: `{"jsonrpc":"2.0","result":"{\"b\":1,\"a\":2.50}","id":1}`,
+		},
+
+		"param that only v1 accepts": {
+			req: `{"jsonrpc": "2.0", "method": "caseClash", "params": [{"Foo": 7}], "id": 1}`,
+			res: `{"jsonrpc":"2.0","result":7,"id":1}`,
+		},
+
+		"param unmarshal method error is returned as is": {
+			req: `{"jsonrpc": "2.0", "method": "rejecting", "params": ["foo"], "id": 1}`,
+			res: `{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid Params","data":"unknown block tag 'foo'"},"id":1}`,
+		},
+
 		"junk + valid params": {
 			req: `{"jsonrpc": "2.0", "method": "multipleOptionalParams", "params": {"param1": 1, "param2": [2, 3], "junk": "junk"}, "id": 1}`,
 			res: `{"jsonrpc":"2.0","error":{"code":-32602,"message":"Invalid Params","data":"unexpected params: junk"},"id":1}`,
@@ -577,7 +708,7 @@ func TestHandle(t *testing.T) {
 }
 
 func TestServerWithDisabledBatchRequests(t *testing.T) {
-	server := jsonrpc.NewServer(1, log.NewNopZapLogger())
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger())
 
 	err := server.RegisterMethods(
 		jsonrpc.Method{
@@ -642,7 +773,7 @@ var benchHandleR http.Header
 
 func BenchmarkHandle(b *testing.B) {
 	listener := CountingEventListener{}
-	server := jsonrpc.NewServer(1, log.NewNopZapLogger()).
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger()).
 		WithValidator(validator.New()).
 		WithListener(&listener)
 	require.NoError(b, server.RegisterMethods(jsonrpc.Method{
@@ -662,10 +793,41 @@ func BenchmarkHandle(b *testing.B) {
 	benchHandleR = header
 }
 
+func BenchmarkHandleParams(b *testing.B) {
+	type blockID struct {
+		Number uint64 `json:"block_number"`
+	}
+	type eventFilter struct {
+		From      blockID    `json:"from_block"`
+		To        string     `json:"to_block"`
+		Address   string     `json:"address"`
+		Keys      [][]string `json:"keys"`
+		ChunkSize uint64     `json:"chunk_size"`
+	}
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger()).
+		WithValidator(validator.New())
+	require.NoError(b, server.RegisterMethods(jsonrpc.Method{
+		Name:    "events",
+		Params:  []jsonrpc.Parameter{{Name: "filter"}},
+		Handler: func(filter eventFilter) (uint64, *jsonrpc.Error) { return filter.ChunkSize, nil },
+	}))
+
+	const request = `{"jsonrpc":"2.0","id":1,"method":"events","params":[{` +
+		`"from_block":{"block_number":123456},"to_block":"latest",` +
+		`"address":"0x49d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7",` +
+		`"keys":[["0x99cd8bde557814842a3121e8ddfd433a539b8c9f14bf31ebf108d12e6196e9"]],` +
+		`"chunk_size":100}]}`
+	var err error
+	for b.Loop() {
+		_, _, err = server.HandleReader(b.Context(), strings.NewReader(request))
+		require.NoError(b, err)
+	}
+}
+
 // BenchmarkHandleLargeRequest measures large bodies (up to the 10MB request
 // limit), where the TeeReader copy scales with the input size.
 func BenchmarkHandleLargeRequest(b *testing.B) {
-	server := jsonrpc.NewServer(1, log.NewNopZapLogger()).WithValidator(validator.New())
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger()).WithValidator(validator.New())
 	require.NoError(b, server.RegisterMethods(jsonrpc.Method{
 		Name:    "echo",
 		Params:  []jsonrpc.Parameter{{Name: "data"}},
@@ -694,7 +856,7 @@ func BenchmarkHandleLargeRequest(b *testing.B) {
 }
 
 func TestCannotWriteToConnInHandler(t *testing.T) {
-	server := jsonrpc.NewServer(1, log.NewNopZapLogger())
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger())
 	require.NoError(t, server.RegisterMethods(jsonrpc.Method{
 		Name: "test",
 		Handler: func(ctx context.Context) (int, *jsonrpc.Error) {
@@ -710,8 +872,63 @@ func TestCannotWriteToConnInHandler(t *testing.T) {
 	require.NotNil(t, header)
 }
 
+func TestHandleReaderReadError(t *testing.T) {
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger())
+	body := io.MultiReader(
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"test"}`),
+		iotest.ErrReader(errors.New("connection reset")),
+	)
+	res, _, err := server.HandleReader(t.Context(), body)
+	require.NoError(t, err)
+	require.Equal(t, `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"jsontext: read error: connection reset"},"id":null}`, string(res))
+}
+
+// stallReader returns (0, nil) before each read of the underlying reader
+type stallReader struct {
+	r       io.Reader
+	stalled bool
+}
+
+func (s *stallReader) Read(p []byte) (int, error) {
+	if s.stalled = !s.stalled; s.stalled {
+		return 0, nil
+	}
+	return s.r.Read(p)
+}
+
+func TestHandleReaderTrailingData(t *testing.T) {
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger())
+	require.NoError(t, server.RegisterMethods(jsonrpc.Method{
+		Name:    "test",
+		Handler: func() (int, *jsonrpc.Error) { return 1, nil },
+	}))
+	req := `{"jsonrpc":"2.0","id":1,"method":"test"}`
+	padding := strings.Repeat(" ", 300)
+
+	t.Run("empty reads are not trailing data", func(t *testing.T) {
+		body := &stallReader{r: iotest.OneByteReader(strings.NewReader(req + padding))}
+		res, _, err := server.HandleReader(t.Context(), body)
+		require.NoError(t, err)
+		require.Equal(t, `{"jsonrpc":"2.0","result":1,"id":1}`, string(res))
+	})
+
+	t.Run("offset spans buffer chunks", func(t *testing.T) {
+		res, _, err := server.HandleReader(t.Context(), strings.NewReader(req+padding+"x"))
+		require.NoError(t, err)
+		require.Contains(t, string(res), fmt.Sprintf(
+			"unexpected data after the request [line 1, position %d]", len(req)+len(padding)+1))
+	})
+}
+
 type fakeConn struct {
 	ctx context.Context
+}
+
+// messageConn hands the server one whole message to read and a connection to
+// write on, as the websocket transport does
+type messageConn struct {
+	io.Reader
+	io.Writer
 }
 
 func (fc *fakeConn) Write(p []byte) (int, error) {
@@ -728,7 +945,7 @@ func (fc *fakeConn) Context() context.Context {
 
 func TestWriteToConnInHandler(t *testing.T) {
 	testBytes := "written from handler"
-	server := jsonrpc.NewServer(1, log.NewNopZapLogger())
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger())
 	wg := conc.NewWaitGroup()
 	t.Cleanup(wg.Wait)
 	require.NoError(t, server.RegisterMethods(jsonrpc.Method{
@@ -754,18 +971,17 @@ func TestWriteToConnInHandler(t *testing.T) {
 	})
 
 	wg.Go(func() {
-		err := server.HandleReadWriter(t.Context(), 0, serverConn)
+		err := server.HandleReadWriter(t.Context(), 0, messageConn{strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"test","params":[]}`), serverConn})
 		require.NoError(t, err)
 	})
 
-	write(t, clientConn, `{"jsonrpc":"2.0","id":1,"method":"test","params":[]}`)
 	initialResp := `{"jsonrpc":"2.0","result":0,"id":1}`
 	require.Equal(t, initialResp, read(t, clientConn, len(initialResp)))
 	require.Equal(t, testBytes, read(t, clientConn, len(testBytes)))
 }
 
 func TestWriteToClosedConnInHandler(t *testing.T) {
-	server := jsonrpc.NewServer(1, log.NewNopZapLogger())
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger())
 	wg := conc.NewWaitGroup()
 	t.Cleanup(wg.Wait)
 	require.NoError(t, server.RegisterMethods(jsonrpc.Method{
@@ -790,13 +1006,12 @@ func TestWriteToClosedConnInHandler(t *testing.T) {
 		// We close clientConn early.
 	})
 
+	require.NoError(t, clientConn.Close())
+
 	wg.Go(func() {
-		err := server.HandleReadWriter(t.Context(), 0, serverConn)
+		err := server.HandleReadWriter(t.Context(), 0, messageConn{strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"test","params":[]}`), serverConn})
 		require.ErrorIs(t, err, io.ErrClosedPipe)
 	})
-
-	write(t, clientConn, `{"jsonrpc":"2.0","id":1,"method":"test","params":[]}`)
-	require.NoError(t, clientConn.Close())
 }
 
 func TestRequest_MarshalLogObject(t *testing.T) {
@@ -808,14 +1023,14 @@ func TestRequest_MarshalLogObject(t *testing.T) {
 			req: &jsonrpc.Request{
 				Version: "2.0",
 				Method:  "starknet_getBlockWithTxs",
-				Params:  []any{"latest"},
-				ID:      1,
+				Params:  json.RawMessage(`["latest"]`),
+				ID:      json.RawMessage("1"),
 			},
 			want: map[string]any{
 				"jsonrpc": "2.0",
 				"method":  "starknet_getBlockWithTxs",
-				"id":      1,
-				"params":  []any{"latest"},
+				"id":      json.RawMessage("1"),
+				"params":  json.RawMessage(`["latest"]`),
 			},
 		},
 		"nil id and params omitted": {
@@ -832,12 +1047,12 @@ func TestRequest_MarshalLogObject(t *testing.T) {
 			req: &jsonrpc.Request{
 				Version: "2.0",
 				Method:  "ping",
-				ID:      "abc",
+				ID:      json.RawMessage(`"abc"`),
 			},
 			want: map[string]any{
 				"jsonrpc": "2.0",
 				"method":  "ping",
-				"id":      "abc",
+				"id":      json.RawMessage(`"abc"`),
 			},
 		},
 		"method with control chars is sanitised": {
@@ -868,15 +1083,10 @@ func read(t *testing.T, c io.Reader, length int) string {
 	return string(got)
 }
 
-func write(t *testing.T, c io.Writer, data string) {
-	_, err := c.Write([]byte(data))
-	require.NoError(t, err)
-}
-
 func TestBatchElementLimit(t *testing.T) {
 	newServer := func(t *testing.T, limit int) (*jsonrpc.Server, *atomic.Int64) {
 		var calls atomic.Int64
-		server := jsonrpc.NewServer(8, log.NewNopZapLogger()).WithMaxBatchElements(limit)
+		server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(8), log.NewNopZapLogger()).WithMaxBatchElements(limit)
 		require.NoError(t, server.RegisterMethods(jsonrpc.Method{
 			Name: "count",
 			Handler: func() (int, *jsonrpc.Error) {
@@ -938,7 +1148,7 @@ func TestBatchResponseSizeLimit(t *testing.T) {
 	const payload = 512
 
 	newServer := func(t *testing.T, workers, limit int) *jsonrpc.Server {
-		server := jsonrpc.NewServer(workers, log.NewNopZapLogger()).
+		server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(workers), log.NewNopZapLogger()).
 			WithMaxBatchElements(0).
 			WithMaxBatchResponseBytes(limit)
 		require.NoError(t, server.RegisterMethods(jsonrpc.Method{
@@ -1050,4 +1260,38 @@ func TestBatchResponseSizeLimit(t *testing.T) {
 			assert.Nil(t, elem.Error)
 		}
 	})
+}
+
+func TestBatchArrayIsByteIdenticalToJSONMarshal(t *testing.T) {
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger())
+	require.NoError(t, server.RegisterMethods(jsonrpc.Method{
+		Name:    "echo",
+		Params:  []jsonrpc.Parameter{{Name: "data"}},
+		Handler: func(data string) (string, *jsonrpc.Error) { return data, nil },
+	}))
+
+	payloads := []string{
+		"<script>a && b</script>",
+		"line\u2028sep\u2029par",
+		`quote " backslash \`,
+		"",
+	}
+
+	elements := make([]string, len(payloads))
+	for i, payload := range payloads {
+		params, err := json.Marshal([]string{payload})
+		require.NoError(t, err)
+		elements[i] = fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"echo","params":%s}`, i+1, params)
+	}
+
+	body, _, err := server.HandleReader(t.Context(), strings.NewReader("["+strings.Join(elements, ",")+"]"))
+	require.NoError(t, err)
+
+	var got []json.RawMessage
+	require.NoError(t, json.Unmarshal(body, &got))
+	require.Len(t, got, len(payloads))
+
+	want, err := json.Marshal(got)
+	require.NoError(t, err)
+	assert.Equal(t, string(want), string(body))
 }

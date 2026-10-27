@@ -104,10 +104,12 @@ func (s *receiptsSubscriberState) onNewHead(
 	_ context.Context,
 	id string,
 	_ *subscription,
-	head *core.Block,
+	headWithBloom *core.WithBloom[*core.Block],
 ) error {
+	head := headWithBloom.Value
 	// Canonical blocks are published exactly once, so they bypass the deduper.
-	for receipt := range receiptsOf(head, s.senders, TxnFinalityStatusWithoutL1(TxnAcceptedOnL2)) {
+	status := TxnFinalityStatusWithoutL1(TxnAcceptedOnL2)
+	for receipt := range receiptsOf(head, s.senders, status, nil) {
 		if err := sendTransactionReceipt(s.conn, &receipt, id); err != nil {
 			return err
 		}
@@ -119,22 +121,22 @@ func (s *receiptsSubscriberState) onPreConfirmed(
 	_ context.Context,
 	id string,
 	_ *subscription,
-	preConfirmed *pending.PreConfirmed,
+	preConfirmedWithBloom *core.WithBloom[*pending.PreConfirmed],
 ) error {
+	preConfirmed := preConfirmedWithBloom.Value
 	block := preConfirmed.GetBlock()
 	status := TxnFinalityStatusWithoutL1(TxnPreConfirmed)
 	// The pre_confirmed tip is re-published in full on every delta; skip already-sent
 	// receipts. A same-height round replacement changes BlockIdentifier and re-emits.
-	for receipt := range receiptsOf(block, s.senders, status) {
-		shouldSend := s.deduper.MarkSent(
+	shouldSend := func(txn core.Transaction) bool {
+		return s.deduper.MarkSent(
 			block.Number,
 			preConfirmed.BlockIdentifier,
-			(*felt.TransactionHash)(receipt.Hash),
+			(*felt.TransactionHash)(txn.Hash()),
 		)
-		if !shouldSend {
-			continue
-		}
+	}
 
+	for receipt := range receiptsOf(block, s.senders, status, shouldSend) {
 		if err := sendTransactionReceipt(s.conn, &receipt, id); err != nil {
 			return err
 		}
@@ -147,10 +149,15 @@ func receiptsOf(
 	block *core.Block,
 	senders []felt.Address,
 	finalityStatus TxnFinalityStatusWithoutL1,
+	shouldSend func(core.Transaction) bool,
 ) iter.Seq[TransactionReceiptWithBlockInfo] {
 	return func(yield func(TransactionReceiptWithBlockInfo) bool) {
 		for i, txn := range block.Transactions {
 			if !filterTxBySender(txn, senders) {
+				continue
+			}
+
+			if shouldSend != nil && !shouldSend(txn) {
 				continue
 			}
 

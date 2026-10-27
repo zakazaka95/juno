@@ -43,16 +43,27 @@ make corpus-gen
 ```
 
 Both take `<corpus>` (config or its folder, `all.json` ↔ `all/`) and `<node>`
-(name in `nodes.json` or a literal URL); remaining args pass through.
+(`nodes/<node>.json`, which sets `url`, or a literal URL); remaining args
+pass through. Machine-specific settings go in the gitignored
+`nodes/<node>.local.json`, merged over `nodes/<node>.json` (local keys win);
+start from `nodes/node.local.json.example`.
 
 `gen-all.sh`: one corpus per config entry (`{"name": "subcommand [flags]"}`)
 into the config's folder, sampling `<node>` via `--source-url`; per-entry
-flags win.
+flags win. `COMPRESS=zstd` writes `<name>.json.zst` (`zstd -1`) instead of
+`<name>.json`.
 
-`run-all.sh`: `run.js` once per corpus against `<node>`. Writes
-`<corpus>/<node>/` (overwritten per re-run): `<method>.html` (dashboard, live
-at `:5665`), `<method>.json` (summary), `report.md`. Failures don't stop the
-sweep.
+`run-all.sh`: `run.js` once per corpus against `<node>`, in config order when
+`<corpus>.json` exists (corpora it doesn't list follow A-Z), else A-Z. The
+folder holds either `<name>.json` or `<name>.json.zst` corpora, never both
+(error); `.json.zst` ones are decompressed into `$TMPDIR` per run and deleted
+after. A listed corpus missing from the folder counts as failed. Writes
+`<corpus>/<node>/` (or `$OUT_DIR`; overwritten per re-run): `<method>.html`
+(dashboard, live at `:5665`), `<method>.json` (summary), `report.md` (rows in
+run order). Failures don't stop the remaining corpora.
+
+`expand.sh <sets> <in.json >out.json`: give each entry a warm-up and
+`<sets>` differently seeded copies, for repeated runs.
 
 ### corpus-gen
 
@@ -94,7 +105,7 @@ Corpus must be redirected in (`<`), not piped. k6 prints its summary to stdout;
 | `--count`       | corpus entries                                 |
 | `--block-start` | sample range low (inclusive, default 0)        |
 | `--block-end`   | sample range high (inclusive, default latest)  |
-| `--seed`        | reproducible corpus                            |
+| `--seed`        | reproducible corpus (mixed with method + options) |
 | `--batch N`     | N requests per entry                           |
 | `--concurrency` | concurrent sampling requests (`GOMAXPROCS`)    |
 | `--source-url`  | node to sample (`http://localhost:6060/v0_10`) |

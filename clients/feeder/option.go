@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/NethermindEth/juno/clients/timeout"
 	"github.com/NethermindEth/juno/utils/log"
 )
 
@@ -18,7 +19,7 @@ type options struct {
 	userAgent  string
 	apiKey     string
 	listener   EventListener
-	timeouts   *Timeouts
+	timeouts   *timeout.Timeouts
 }
 
 // Option is a functional option for configuring the feeder client.
@@ -61,5 +62,19 @@ func WithHTTPClient(client *http.Client) Option {
 }
 
 func WithTimeouts(timeouts []time.Duration, fixed bool) Option {
-	return func(o *options) { o.timeouts = makeTimeouts(timeouts, fixed) }
+	return func(o *options) { o.timeouts = timeout.New(timeouts, fixed) }
+}
+
+// requestConfig holds per-request overrides of the client's retry behavior.
+type requestConfig struct {
+	failFastCodes []int
+}
+
+// requestOption is a functional option applied to a single request.
+type requestOption func(*requestConfig)
+
+// failFastOn makes get return a response with one of the given HTTP status codes right
+// away instead of retrying it, for callers that handle those statuses themselves.
+func failFastOn(codes ...int) requestOption {
+	return func(c *requestConfig) { c.failFastCodes = append(c.failFastCodes, codes...) }
 }

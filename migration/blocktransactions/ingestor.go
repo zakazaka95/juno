@@ -10,8 +10,8 @@ import (
 	"github.com/NethermindEth/juno/db/typed/prefix"
 	"github.com/NethermindEth/juno/migration/pipeline"
 	"github.com/NethermindEth/juno/migration/semaphore"
+	"github.com/NethermindEth/juno/utils/cbor"
 	"github.com/NethermindEth/juno/utils/log"
-	"github.com/fxamacker/cbor/v2"
 	"go.uber.org/zap"
 )
 
@@ -168,7 +168,9 @@ func (c *ingestor) validateCount(
 	return nil
 }
 
-func extractValues(seq iter.Seq2[prefix.Entry[[]byte], error]) iter.Seq2[cbor.RawMessage, error] {
+func extractValues(
+	seq iter.Seq2[prefix.Entry[[]byte], error],
+) iter.Seq2[cbor.RawMessage, error] {
 	return func(yield func(cbor.RawMessage, error) bool) {
 		for item, err := range seq {
 			if !yield(cbor.RawMessage(item.Value), err) {
@@ -179,7 +181,8 @@ func extractValues(seq iter.Seq2[prefix.Entry[[]byte], error]) iter.Seq2[cbor.Ra
 }
 
 func deleteOldBlockRangeData(batch db.KeyValueRangeDeleter, startBlock, endBlock uint64) error {
-	err := core.TransactionsByBlockNumberAndIndexBucket.Prefix().DeleteRange(
+	//nolint:staticcheck,nolintlint // old transaction layout
+	err := core.DeprecatedTransactionsByBlockNumberAndIndexBucket.Prefix().DeleteRange(
 		batch,
 		startBlock,
 		endBlock+1,
@@ -188,7 +191,8 @@ func deleteOldBlockRangeData(batch db.KeyValueRangeDeleter, startBlock, endBlock
 		return err
 	}
 
-	return core.ReceiptsByBlockNumberAndIndexBucket.Prefix().DeleteRange(
+	//nolint:staticcheck,nolintlint // old transaction layout
+	return core.DeprecatedReceiptsByBlockNumberAndIndexBucket.Prefix().DeleteRange(
 		batch,
 		startBlock,
 		endBlock+1,

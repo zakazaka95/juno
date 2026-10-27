@@ -37,8 +37,8 @@ type Sequencer struct {
 	blockTime        time.Duration
 	mempool          *mempool.SequencerMempool
 
-	subNewHeads     *feed.Feed[*core.Block]
-	subPreConfirmed *feed.Feed[*pending.PreConfirmed]
+	subNewHeads     *feed.Feed[*core.WithBloom[*core.Block]]
+	subPreConfirmed *feed.Feed[*core.WithBloom[*pending.PreConfirmed]]
 	subReorgFeed    *feed.Feed[*sync.ReorgBlockRange]
 	plugin          plugin.JunoPlugin
 
@@ -61,8 +61,8 @@ func New(
 		privKey:          privKey,
 		logger:           logger,
 		blockTime:        blockTime,
-		subNewHeads:      feed.New[*core.Block](),
-		subPreConfirmed:  feed.New[*pending.PreConfirmed](),
+		subNewHeads:      feed.New[*core.WithBloom[*core.Block]](),
+		subPreConfirmed:  feed.New[*core.WithBloom[*pending.PreConfirmed]](),
 		subReorgFeed:     feed.New[*sync.ReorgBlockRange](),
 	}
 }
@@ -105,7 +105,14 @@ func (s *Sequencer) Run(ctx context.Context) error {
 			s.mu.Lock()
 
 			preConfirmed := s.buildState.PreConfirmed
-			if err := s.builder.Finalise(preConfirmed, newBlockSigner(s.privKey), s.privKey); err != nil {
+			eventsBloom := core.EventsBloom(preConfirmed.Block.Receipts)
+			err := s.builder.Finalise(
+				preConfirmed,
+				newBlockSigner(s.privKey),
+				s.privKey,
+				eventsBloom,
+			)
+			if err != nil {
 				return err
 			}
 			s.logger.Infof("Finalised new block")
@@ -116,7 +123,7 @@ func (s *Sequencer) Run(ctx context.Context) error {
 				}
 			}
 			// push the new head to the feed
-			s.subNewHeads.Send(preConfirmed.Block)
+			s.subNewHeads.Send(&core.WithBloom[*core.Block]{Value: preConfirmed.Block, Bloom: eventsBloom})
 
 			if err := s.initPendingBlock(); err != nil {
 				return err
@@ -160,7 +167,8 @@ func (s *Sequencer) listenPool(ctx context.Context) error {
 
 		// push the preconfirmed block to the feed
 		preconfirmed := pending.NewPreConfirmed(s.buildState.PreConfirmedBlock(), nil, nil, "")
-		s.subPreConfirmed.Send(&preconfirmed)
+		preConfirmedWithBloom := pending.NewPreConfirmedWithBloom(&preconfirmed)
+		s.subPreConfirmed.Send(&preConfirmedWithBloom)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -200,7 +208,13 @@ func (s *Sequencer) depletePool(ctx context.Context) error {
 	}
 }
 
-func (s *Sequencer) PreConfirmedChain() (preconfirmed.ChainReader, error) {
+// RequestPreConfirmedChain is the same as [Sequencer.ReadPreConfirmedChain]: the sequencer
+// builds the pre-confirmed block itself, so there is nothing to poll for.
+func (s *Sequencer) RequestPreConfirmedChain() (preconfirmed.ChainReader, error) {
+	return s.ReadPreConfirmedChain()
+}
+
+func (s *Sequencer) ReadPreConfirmedChain() (preconfirmed.ChainReader, error) {
 	if s.buildState.PreConfirmed == nil {
 		return preconfirmed.ChainReader{}, pending.ErrPreConfirmedNotFound
 	}
@@ -233,6 +247,6 @@ func (s *Sequencer) SubscribeNewHeads() sync.NewHeadSubscription {
 	return sync.NewHeadSubscription{Subscription: s.subNewHeads.Subscribe()}
 }
 
-func (s *Sequencer) SubscribePreConfirmed() sync.PreConfirmedDataSubscription {
-	return sync.PreConfirmedDataSubscription{Subscription: s.subPreConfirmed.Subscribe()}
+func (s *Sequencer) SubscribePreConfirmed() preconfirmed.Subscription {
+	return preconfirmed.Subscription{Subscription: s.subPreConfirmed.Subscribe()}
 }

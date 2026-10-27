@@ -7,6 +7,7 @@ import (
 
 	"github.com/NethermindEth/juno/jsonrpc"
 	"github.com/NethermindEth/juno/utils/log"
+	"github.com/sourcegraph/conc/pool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -88,18 +89,13 @@ var parseErrorTests = map[string]struct {
 	},
 
 	"type mismatch behind the captured window drops the position and marker": {
-		req: `{"jsonrpc": 5, "method": "x", "params": [` + strings.Repeat(`"0x1", `, 80) + `"0x2"], "id": 1}`,
+		req: `{"jsonrpc": ` + strings.Repeat("1", 600) + `, "method": "x", "id": 1}`,
 		res: `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"field \"jsonrpc\" should be string, got number"},"id":null}`,
 	},
 
 	"syntax error behind the captured window drops the position and marker": {
 		req: `{"jsonrpc": "2.0", "params": [` + strings.Repeat(`"0x1", `, 400) + ` @ ` + strings.Repeat(`"0x1", `, 400) + `"0x2"]}`,
-		res: `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"invalid character '@' looking for beginning of value"},"id":null}`,
-	},
-
-	"error exactly at the window start still draws the marker": {
-		req: `{"jsonrpc": 5, "method": "x", "params": [` + strings.Repeat(`"0x1", `, 66) + strings.Repeat(" ", 5) + `"0x2"], "id": 1}`,
-		res: `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"5, \"method\": \"x\", \"params\": [\"0x1\", \"0x1\", \"0x1\", \"0x1\", \"0x1\", \"0x1\", \"0x...\n^\nfield \"jsonrpc\" should be string, got number [line 1, position 13]"},"id":null}`,
+		res: `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"invalid character '@' at start of value"},"id":null}`,
 	},
 
 	"long line is windowed": {
@@ -228,8 +224,7 @@ func (r *maxChunkReader) Read(p []byte) (int, error) {
 }
 
 func TestHandleParseError(t *testing.T) {
-	server := jsonrpc.NewServer(1, log.NewNopZapLogger())
-
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger())
 	for desc, test := range parseErrorTests {
 		t.Run(desc, func(t *testing.T) {
 			reader := strings.NewReader(test.req)
@@ -242,7 +237,7 @@ func TestHandleParseError(t *testing.T) {
 }
 
 func TestHandleParseErrorChunked(t *testing.T) {
-	server := jsonrpc.NewServer(1, log.NewNopZapLogger())
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), log.NewNopZapLogger())
 	cases := map[string]struct {
 		req string
 		res string

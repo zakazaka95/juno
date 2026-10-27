@@ -56,6 +56,36 @@ func (mr *MockSyncReaderMockRecorder) HighestBlockHeader() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HighestBlockHeader", reflect.TypeOf((*MockSyncReader)(nil).HighestBlockHeader))
 }
 
+// ReadPreConfirmedChain mocks base method.
+func (m *MockSyncReader) ReadPreConfirmedChain() (preconfirmed.ChainReader, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ReadPreConfirmedChain")
+	ret0, _ := ret[0].(preconfirmed.ChainReader)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ReadPreConfirmedChain indicates an expected call of ReadPreConfirmedChain.
+func (mr *MockSyncReaderMockRecorder) ReadPreConfirmedChain() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReadPreConfirmedChain", reflect.TypeOf((*MockSyncReader)(nil).ReadPreConfirmedChain))
+}
+
+// RequestPreConfirmedChain mocks base method.
+func (m *MockSyncReader) RequestPreConfirmedChain() (preconfirmed.ChainReader, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RequestPreConfirmedChain")
+	ret0, _ := ret[0].(preconfirmed.ChainReader)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RequestPreConfirmedChain indicates an expected call of RequestPreConfirmedChain.
+func (mr *MockSyncReaderMockRecorder) RequestPreConfirmedChain() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RequestPreConfirmedChain", reflect.TypeOf((*MockSyncReader)(nil).RequestPreConfirmedChain))
+}
+
 // StartingBlockHeader mocks base method.
 func (m *MockSyncReader) StartingBlockHeader() (*core.Header, error) {
 	m.ctrl.T.Helper()
@@ -68,30 +98,7 @@ func (m *MockSyncReader) StartingBlockHeader() (*core.Header, error) {
 // StartingBlockHeader indicates an expected call of StartingBlockHeader.
 func (mr *MockSyncReaderMockRecorder) StartingBlockHeader() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(
-		mr.mock,
-		"StartingBlockHeader",
-		reflect.TypeOf((*MockSyncReader)(nil).StartingBlockHeader),
-	)
-}
-
-// PreConfirmedChain mocks base method.
-func (m *MockSyncReader) PreConfirmedChain() (preconfirmed.ChainReader, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "PreConfirmedChain")
-	ret0, _ := ret[0].(preconfirmed.ChainReader)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// PreConfirmedChain indicates an expected call of PreConfirmedChain.
-func (mr *MockSyncReaderMockRecorder) PreConfirmedChain() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(
-		mr.mock,
-		"PreConfirmedChain",
-		reflect.TypeOf((*MockSyncReader)(nil).PreConfirmedChain),
-	)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StartingBlockHeader", reflect.TypeOf((*MockSyncReader)(nil).StartingBlockHeader))
 }
 
 // SubscribeNewHeads mocks base method.
@@ -109,10 +116,10 @@ func (mr *MockSyncReaderMockRecorder) SubscribeNewHeads() *gomock.Call {
 }
 
 // SubscribePreConfirmed mocks base method.
-func (m *MockSyncReader) SubscribePreConfirmed() sync.PreConfirmedDataSubscription {
+func (m *MockSyncReader) SubscribePreConfirmed() preconfirmed.Subscription {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "SubscribePreConfirmed")
-	ret0, _ := ret[0].(sync.PreConfirmedDataSubscription)
+	ret0, _ := ret[0].(preconfirmed.Subscription)
 	return ret0
 }
 

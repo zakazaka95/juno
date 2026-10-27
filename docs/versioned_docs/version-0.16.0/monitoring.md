@@ -1,8 +1,9 @@
 ---
 title: Monitoring
+description: "Monitor a Juno node with Prometheus metrics, Grafana, and the /live and /ready readiness endpoints."
 ---
 
-# Metrics Monitoring :bar_chart:
+# Metrics Monitoring
 
 Juno uses [Prometheus](https://prometheus.io/) to monitor and collect metrics data, which you can visualise with [Grafana](https://grafana.com/). You can use these insights to understand what is happening when Juno is running.
 
@@ -138,6 +139,11 @@ readinessProbe:
   failureThreshold: 3
 ```
 
+### `/ready/rpc` endpoint
+
+The `/ready/rpc` endpoint returns `200 OK` once the database has a canonical head and RPC requests can be served.
+Use it as the readiness probe for tests or benchmarks started with `--disable-sync` and a preloaded database.
+
 ### Configuring readiness criteria
 
 You can configure what "synced" means for the `/ready` endpoint using the `readiness-block-tolerance` configuration option:
@@ -198,14 +204,14 @@ In case you want to change the log level in runtime without the need to restart 
 
 To enable this feature, use the following configuration options:
 
-- `log-host`: The interface to listen for requests. Defaults to `localhost`.
-- `log-port`: The port to listen for requests.  REQUIRED
+- `http-update-host`: The interface to listen for requests. Defaults to `localhost`.
+- `http-update-port`: The port to listen for requests. REQUIRED
 
 Examples:
 
 ```console
 # Start juno specifying the log port
-juno --log-port=6789 --log-level=error ...
+juno --http-update-port=6789 --log-level=error ...
 
 # Get current level
 curl -X GET 'localhost:6789/log/level'

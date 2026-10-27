@@ -5,6 +5,7 @@ import (
 
 	"github.com/NethermindEth/juno/core"
 	"github.com/NethermindEth/juno/core/felt"
+	"github.com/NethermindEth/juno/rpc/tracecache"
 	"github.com/NethermindEth/juno/starknet"
 	"github.com/NethermindEth/juno/vm"
 )
@@ -319,45 +320,7 @@ func AdaptFeederBlockTrace(
 	for index := range blockTrace.Traces {
 		feederTrace := &blockTrace.Traces[index]
 
-		trace := TransactionTrace{
-			Type: transactionTypeFrom(transactions[index]),
-		}
-
-		if feederTrace.FeeTransferInvocation != nil && trace.Type != TxnL1Handler {
-			trace.FeeTransferInvocation = new(
-				AdaptFeederFunctionInvocation(feederTrace.FeeTransferInvocation),
-			)
-		}
-
-		if feederTrace.ValidateInvocation != nil && trace.Type != TxnL1Handler {
-			trace.ValidateInvocation = new(
-				AdaptFeederFunctionInvocation(feederTrace.ValidateInvocation),
-			)
-		}
-
-		var fnInvocation *FunctionInvocation
-		if fct := feederTrace.FunctionInvocation; fct != nil {
-			fnInvocation = new(AdaptFeederFunctionInvocation(fct))
-		}
-
-		switch trace.Type {
-		case TxnDeploy, TxnDeployAccount:
-			trace.ConstructorInvocation = fnInvocation
-		case TxnInvoke:
-			trace.ExecuteInvocation = new(ExecuteInvocation)
-			if feederTrace.RevertError != "" {
-				trace.ExecuteInvocation.RevertReason = feederTrace.RevertError
-			} else {
-				trace.ExecuteInvocation.FunctionInvocation = fnInvocation
-			}
-		case TxnL1Handler:
-			trace.FunctionInvocation = new(ExecuteInvocation)
-			if feederTrace.RevertError != "" {
-				trace.FunctionInvocation.RevertReason = feederTrace.RevertError
-			} else {
-				trace.FunctionInvocation.FunctionInvocation = fnInvocation
-			}
-		}
+		trace := adaptFeederTransactionTrace(transactionTypeFrom(transactions[index]), feederTrace)
 
 		adaptedTraces[index] = TracedBlockTransaction{
 			TransactionHash: &feederTrace.TransactionHash,
@@ -431,4 +394,96 @@ func adaptFeederExecutionResources(resources *starknet.ExecutionResources) Inner
 		L1Gas: l1Gas,
 		L2Gas: l2Gas,
 	}
+}
+
+func adaptFeederTransactionTrace(
+	kind TransactionType, feederTrace *starknet.TransactionTrace,
+) TransactionTrace {
+	trace := TransactionTrace{
+		Type: kind,
+	}
+
+	if feederTrace.FeeTransferInvocation != nil && trace.Type != TxnL1Handler {
+		trace.FeeTransferInvocation = new(
+			AdaptFeederFunctionInvocation(feederTrace.FeeTransferInvocation),
+		)
+	}
+
+	if feederTrace.ValidateInvocation != nil && trace.Type != TxnL1Handler {
+		trace.ValidateInvocation = new(
+			AdaptFeederFunctionInvocation(feederTrace.ValidateInvocation),
+		)
+	}
+
+	var fnInvocation *FunctionInvocation
+	if fct := feederTrace.FunctionInvocation; fct != nil {
+		fnInvocation = new(AdaptFeederFunctionInvocation(fct))
+	}
+
+	switch trace.Type {
+	case TxnDeploy, TxnDeployAccount:
+		trace.ConstructorInvocation = fnInvocation
+	case TxnInvoke:
+		trace.ExecuteInvocation = new(ExecuteInvocation)
+		if feederTrace.RevertError != "" {
+			trace.ExecuteInvocation.RevertReason = feederTrace.RevertError
+		} else {
+			trace.ExecuteInvocation.FunctionInvocation = fnInvocation
+		}
+	case TxnL1Handler:
+		trace.FunctionInvocation = new(ExecuteInvocation)
+		if feederTrace.RevertError != "" {
+			trace.FunctionInvocation.RevertReason = feederTrace.RevertError
+		} else {
+			trace.FunctionInvocation.FunctionInvocation = fnInvocation
+		}
+	}
+
+	return trace
+}
+
+func adaptCachedTrace(source *tracecache.TransactionTrace, result *TransactionTrace) {
+	if feeder := source.FeederTrace(); feeder != nil {
+		*result = adaptFeederTransactionTrace(TransactionType(source.Type), feeder)
+	} else {
+		*result = AdaptVMTransactionTrace(source.VMTrace())
+	}
+	if result.ExecutionResources == nil {
+		result.ExecutionResources = new(ExecutionResources)
+	}
+	*result.ExecutionResources = ExecutionResources{
+		InnerExecutionResources: InnerExecutionResources{
+			L1Gas: source.Gas.L1Gas,
+			L2Gas: source.Gas.L2Gas,
+		},
+		L1DataGas: source.Gas.L1DataGas,
+	}
+}
+
+func adaptCachedTraces(result *tracecache.BlockTrace) []TracedBlockTransaction {
+	traces := make([]TracedBlockTransaction, len(result.Traces))
+	roots := make([]TransactionTrace, len(result.Traces))
+	for i := range result.Traces {
+		adaptCachedTrace(&result.Traces[i], &roots[i])
+		traces[i] = TracedBlockTransaction{
+			TraceRoot:       &roots[i],
+			TransactionHash: &result.Traces[i].Hash,
+		}
+	}
+	return traces
+}
+
+func adaptCachedBlock(
+	result *tracecache.BlockTrace, returnInitialReads bool,
+) TraceBlockTransactionsResponse {
+	response := TraceBlockTransactionsResponse{Traces: adaptCachedTraces(result)}
+	if returnInitialReads {
+		if result.Source == tracecache.Feeder {
+			response.InitialReads = &InitialReads{}
+		} else if result.InitialReads != nil {
+			reads := adaptVMInitialReads(result.InitialReads)
+			response.InitialReads = &reads
+		}
+	}
+	return response
 }

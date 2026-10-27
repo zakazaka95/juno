@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder/adaptfeedertest"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
 	"github.com/NethermindEth/juno/core"
@@ -12,7 +13,6 @@ import (
 	"github.com/NethermindEth/juno/l1/eth"
 	"github.com/NethermindEth/juno/mocks"
 	rpc "github.com/NethermindEth/juno/rpc/v9"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 )
@@ -84,9 +84,7 @@ func TestGetMessageStatus(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			client := feeder.NewTestClient(t, &test.network)
-			gw := adaptfeeder.New(client)
-			block, err := gw.BlockByNumber(t.Context(), test.blockNum)
-			require.NoError(t, err)
+			block := adaptfeedertest.Block(t, client, test.blockNum)
 
 			preConfirmed := &pending.PreConfirmed{
 				Block: &core.Block{
@@ -96,7 +94,8 @@ func TestGetMessageStatus(t *testing.T) {
 					},
 				},
 			}
-			mockSyncReader.EXPECT().PreConfirmedChain().Return(mustNewChain(t, preConfirmed), nil).AnyTimes()
+			mockSyncReader.EXPECT().ReadPreConfirmedChain().
+				Return(mustNewChain(t, preConfirmed), nil).AnyTimes()
 
 			mockL1Client.EXPECT().TransactionReceipt(
 				gomock.Any(), gomock.Any(),

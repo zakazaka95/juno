@@ -3,6 +3,7 @@ package trie2
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/NethermindEth/juno/core/crypto"
 	"github.com/NethermindEth/juno/core/felt"
@@ -21,61 +22,182 @@ func NewProofNodeSet() *ProofNodeSet {
 // The result contains the proof nodes on the path from the root to the leaf.
 // The value is included in the proof if the key is present in the trie.
 // If the key is not present, the proof will contain the nodes on the path to the closest ancestor.
+// Prove is kept as a compatibility wrapper for existing single-key callers.
+// New multi-key proof generation should use ProveMulti.
 func (t *Trie) Prove(key *felt.Felt, proof *ProofNodeSet) error {
+	return t.ProveMulti([]felt.Felt{*key}, proof)
+}
+
+// ProveMulti generates Merkle proofs for multiple keys with a shared trie traversal.
+// Keys are sorted by trie path internally so shared prefixes are visited once.
+func (t *Trie) ProveMulti(keys []felt.Felt, proof *ProofNodeSet) error {
 	if t.committed {
 		return ErrCommitted
 	}
 
-	path := trieutils.FeltToPath(key, t.height)
+	if len(keys) == 0 || t.height == 0 {
+		return nil
+	}
 
-	var (
-		nodes    []trienode.Node
-		prefix   = new(Path)
-		rootNode = t.root
-	)
+	paths := make([]Path, len(keys))
+	for i := range keys {
+		paths[i] = trieutils.FeltToPath(&keys[i], t.height)
+	}
 
-	for path.Len() > 0 && rootNode != nil {
-		switch n := rootNode.(type) {
-		case *trienode.EdgeNode:
-			if !n.PathMatches(&path) {
-				rootNode = nil // Trie doesn't contain the key
-			} else {
-				rootNode = n.Child
-				prefix.Append(prefix, n.Path)
-				(&path).LSBs(&path, n.Path.Len())
-			}
-			nodes = append(nodes, n)
-		case *trienode.BinaryNode:
-			bit := (&path).MSB()
-			rootNode = n.Children[bit]
-			prefix.AppendBit(prefix, bit)
-			(&path).LSBs(&path, 1)
-			nodes = append(nodes, n)
-		case *trienode.HashNode:
-			resolved, err := t.resolveNode(n, *prefix)
-			if err != nil {
-				return err
-			}
-			rootNode = resolved
-		default:
-			panic(fmt.Sprintf("key: %s, unknown node type: %T", key.String(), n))
+	// FeltToPath returns the trie path, so this order groups keys with shared
+	// prefixes and lets proveMultiFrom split each subtree as a contiguous range.
+	slices.SortFunc(paths, func(a, b Path) int {
+		return a.Cmp(&b)
+	})
+
+	dedupedPaths := paths[:0]
+	for i := range paths {
+		if len(dedupedPaths) == 0 || !paths[i].Equal(&dedupedPaths[len(dedupedPaths)-1]) {
+			dedupedPaths = append(dedupedPaths, paths[i])
 		}
 	}
 
+	var prefix Path
 	hasher := newHasher(t.hashFn, false)
-	for i, n := range nodes {
-		var hn trienode.Node
-		n, hn = hasher.proofHash(n)
-		if hash, ok := hn.(*trienode.HashNode); ok || i == 0 {
-			if !ok {
-				hashVal := n.Hash(hasher.hashFn)
-				hash = (*trienode.HashNode)(&hashVal)
-			}
-			proof.Put(felt.Felt(*hash), n)
-		}
+	return t.proveMultiFrom(t.root, prefix, dedupedPaths, true, &hasher, proof)
+}
+
+func (t *Trie) proveMultiFrom(
+	rootNode trienode.Node,
+	prefix Path,
+	paths []Path,
+	isRoot bool,
+	hasher *hasher,
+	proof *ProofNodeSet,
+) error {
+	if rootNode == nil || len(paths) == 0 {
+		return nil
 	}
 
-	return nil
+	rootNode, err := t.resolveProofNode(rootNode, prefix)
+	if err != nil {
+		return err
+	}
+
+	switch n := rootNode.(type) {
+	case *trienode.EdgeNode:
+		return t.proveMultiFromEdge(n, prefix, paths, isRoot, hasher, proof)
+	case *trienode.BinaryNode:
+		return t.proveMultiFromBinary(n, prefix, paths, isRoot, hasher, proof)
+	default:
+		panic(fmt.Sprintf("unknown node type: %T", n))
+	}
+}
+
+func (t *Trie) resolveProofNode(rootNode trienode.Node, prefix Path) (trienode.Node, error) {
+	for {
+		hashNode, ok := rootNode.(*trienode.HashNode)
+		if !ok {
+			return rootNode, nil
+		}
+
+		resolved, err := t.resolveNode(hashNode, prefix)
+		if err != nil {
+			return nil, err
+		}
+		rootNode = resolved
+	}
+}
+
+func (t *Trie) proveMultiFromEdge(
+	node *trienode.EdgeNode,
+	prefix Path,
+	paths []Path,
+	isRoot bool,
+	hasher *hasher,
+	proof *ProofNodeSet,
+) error {
+	addProofNode(proof, hasher, node, isRoot)
+
+	matchingPaths := matchingEdgePaths(node, paths)
+	if len(matchingPaths) == 0 {
+		return nil
+	}
+
+	var childPrefix Path
+	childPrefix.Append(&prefix, node.Path)
+	return t.proveMultiFrom(node.Child, childPrefix, matchingPaths, false, hasher, proof)
+}
+
+func matchingEdgePaths(node *trienode.EdgeNode, paths []Path) []Path {
+	matchingPaths := paths[:0]
+	for i := range paths {
+		if node.PathMatches(&paths[i]) {
+			var remaining Path
+			remaining.LSBs(&paths[i], node.Path.Len())
+			if remaining.Len() > 0 {
+				matchingPaths = append(matchingPaths, remaining)
+			}
+		}
+	}
+	return matchingPaths
+}
+
+func (t *Trie) proveMultiFromBinary(
+	node *trienode.BinaryNode,
+	prefix Path,
+	paths []Path,
+	isRoot bool,
+	hasher *hasher,
+	proof *ProofNodeSet,
+) error {
+	addProofNode(proof, hasher, node, isRoot)
+
+	leftPaths, rightPaths := splitPathsByMSB(paths)
+	leftPaths = dropMSB(leftPaths)
+	rightPaths = dropMSB(rightPaths)
+
+	var leftPrefix Path
+	leftPrefix.AppendBit(&prefix, 0)
+	if err := t.proveMultiFrom(node.Left(), leftPrefix, leftPaths, false, hasher, proof); err != nil {
+		return err
+	}
+
+	var rightPrefix Path
+	rightPrefix.AppendBit(&prefix, 1)
+	return t.proveMultiFrom(node.Right(), rightPrefix, rightPaths, false, hasher, proof)
+}
+
+func splitPathsByMSB(paths []Path) ([]Path, []Path) {
+	rightStart := len(paths)
+	for i := range paths {
+		if paths[i].MSB() == 1 {
+			rightStart = i
+			break
+		}
+	}
+	return paths[:rightStart], paths[rightStart:]
+}
+
+func addProofNode(proof *ProofNodeSet, hasher *hasher, node trienode.Node, isRoot bool) {
+	proofNode, hashNode := hasher.proofHash(node)
+	hash, ok := hashNode.(*trienode.HashNode)
+	if !ok {
+		if !isRoot {
+			return
+		}
+		hashVal := proofNode.Hash(hasher.hashFn)
+		hash = (*trienode.HashNode)(&hashVal)
+	}
+
+	proof.Put(felt.Felt(*hash), proofNode)
+}
+
+func dropMSB(paths []Path) []Path {
+	trimmedPaths := paths[:0]
+	for i := range paths {
+		var remaining Path
+		remaining.LSBs(&paths[i], 1)
+		if remaining.Len() > 0 {
+			trimmedPaths = append(trimmedPaths, remaining)
+		}
+	}
+	return trimmedPaths
 }
 
 // GetRangeProof generates a range proof for the given range of keys.

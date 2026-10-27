@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/NethermindEth/juno/blockchain"
-	"github.com/NethermindEth/juno/clients/feeder"
+	"github.com/NethermindEth/juno/clients/timeout"
 	"github.com/NethermindEth/juno/db"
 	junogrpc "github.com/NethermindEth/juno/grpc"
 	"github.com/NethermindEth/juno/grpc/gen"
@@ -103,23 +103,11 @@ func makeRPCOverHTTP(
 	metricsEnabled bool,
 	corsEnabled bool,
 	rpcRequestTimeout time.Duration,
-	maxConcurrentRequests uint,
-	maxRequestQueue uint,
+	gate *jsonrpc.Gate,
 ) *httpService {
 	var listener jsonrpc.NewRequestListener
 	if metricsEnabled {
 		listener = makeHTTPMetrics()
-	}
-
-	// A single gate shared across all RPC servers (v8/v9/v10) so the limit
-	// protects the whole process, not each version independently. Disabled when
-	// maxConcurrentRequests is 0.
-	var gate *jsonrpc.Gate
-	if maxConcurrentRequests > 0 {
-		gate = jsonrpc.NewGate(maxConcurrentRequests, uint64(maxRequestQueue))
-		if metricsEnabled {
-			makeHTTPGateMetrics(gate)
-		}
 	}
 
 	mux := http.NewServeMux()
@@ -156,6 +144,7 @@ func makeRPCOverWebsocket(
 	metricsEnabled bool,
 	corsEnabled bool,
 	rpcRequestTimeout time.Duration,
+	gate *jsonrpc.Gate,
 ) *httpService {
 	var listener jsonrpc.NewRequestListener
 	if metricsEnabled {
@@ -167,7 +156,8 @@ func makeRPCOverWebsocket(
 	mux := http.NewServeMux()
 	for path, server := range servers {
 		wsHandler := jsonrpc.NewWebsocket(server, shutdown, logger).
-			WithRequestTimeout(rpcRequestTimeout)
+			WithRequestTimeout(rpcRequestTimeout).
+			WithGate(gate)
 		if listener != nil {
 			wsHandler = wsHandler.WithListener(listener)
 		}
@@ -199,15 +189,17 @@ func makeHTTPUpdateService(
 	host string,
 	port uint16,
 	logLevel *log.Level,
-	feederClient *feeder.Client,
+	clients ...timeout.Client,
 ) *httpService {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/log/level", func(w http.ResponseWriter, r *http.Request) {
 		log.HTTPLogSettings(w, r, logLevel)
 	})
-	mux.HandleFunc("/feeder/timeouts", func(w http.ResponseWriter, r *http.Request) {
-		feeder.HTTPTimeoutsSettings(w, r, feederClient)
-	})
+	if len(clients) > 0 {
+		mux.HandleFunc("/feeder/timeouts", func(w http.ResponseWriter, r *http.Request) {
+			timeout.HTTPTimeoutsSettings(w, r, clients...)
+		})
+	}
 	var handler http.Handler = mux
 	return makeHTTPService(host, port, handler)
 }

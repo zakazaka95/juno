@@ -5,11 +5,13 @@ import (
 	"errors"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/core"
 	"github.com/NethermindEth/juno/core/felt"
+	"github.com/NethermindEth/juno/core/pending"
 	"github.com/NethermindEth/juno/jsonrpc"
 	"github.com/NethermindEth/juno/mocks"
 	"github.com/NethermindEth/juno/rpc/rpccore"
@@ -182,6 +184,51 @@ func TestSimulateTransactions(t *testing.T) {
 			require.Equal(t, test.simulatedTxs, simulatedTxs.SimulatedTransactions)
 		})
 	}
+
+	t.Run("pre_confirmed", func(t *testing.T) {
+		t.Parallel()
+		mockCtrl := gomock.NewController(t)
+
+		mockReader := mocks.NewMockReader(mockCtrl)
+		mockSyncReader := mocks.NewMockSyncReader(mockCtrl)
+		mockVM := mocks.NewMockVM(mockCtrl)
+		handler := rpcv10.New(mockReader, mockSyncReader, mockVM, log.NewNopZapLogger())
+
+		stateDiff := core.EmptyStateDiff()
+		preConfirmed := pending.PreConfirmed{
+			Block:       &core.Block{Header: &core.Header{Number: 2, Timestamp: 102}},
+			StateUpdate: &core.StateUpdate{StateDiff: &stateDiff},
+		}
+		mockReader.EXPECT().Network().Return(n)
+		mockSyncReader.EXPECT().RequestPreConfirmedChain().
+			Return(mustNewChain(t, &preConfirmed), nil)
+		mockReader.EXPECT().StateAtBlockNumber(preConfirmed.Block.Number-1).
+			Return(mocks.NewMockStateReader(mockCtrl), nopCloser, nil)
+		mockVM.EXPECT().Simulate(
+			[]core.Transaction{},
+			nil,
+			&vm.BlockInfo{Header: preConfirmed.Block.Header},
+			gomock.Any(),
+			vm.SimulateOptions{},
+		).Return(vm.ExecutionResults{
+			OverallFees:      []*felt.Felt{},
+			DataAvailability: []core.DataAvailability{},
+			GasConsumed:      []core.GasConsumed{},
+			Traces:           []vm.TransactionTrace{},
+			NumSteps:         uint64(123),
+		}, nil)
+
+		blockID := rpcv10.BlockIDPreConfirmed()
+		simulatedTxs, httpHeader, err := handler.SimulateTransactions(
+			t.Context(),
+			&blockID,
+			rpcv10.BroadcastedTransactionInputs{},
+			nil,
+		)
+		require.Nil(t, err)
+		require.Equal(t, "123", httpHeader.Get(rpcv10.ExecutionStepsHeader))
+		require.Equal(t, []rpcv10.SimulatedTransaction{}, simulatedTxs.SimulatedTransactions)
+	})
 }
 
 func TestSimulateTransactionsShouldErrorWithoutSenderAddressOrResourceBounds(t *testing.T) {
@@ -467,4 +514,53 @@ func TestSimulateTransactionsWithReturnInitialReads(t *testing.T) {
 			require.Equal(t, test.expectedInitialReads, simulatedTxs.InitialReads)
 		})
 	}
+}
+
+func TestSimulateTransactionsResponseMarshalJSON(t *testing.T) {
+	simulated := []rpcv10.SimulatedTransaction{{
+		FeeEstimation: rpcv10.FeeEstimate{OverallFee: felt.NewFromUint64[felt.Felt](7)},
+	}}
+
+	t.Run("without initial reads marshals as an array", func(t *testing.T) {
+		data, err := json.Marshal(rpcv10.SimulateTransactionsResponse{SimulatedTransactions: simulated})
+		require.NoError(t, err)
+		require.True(t, strings.HasPrefix(string(data), "["), string(data))
+		require.NotContains(t, string(data), "initial_reads")
+	})
+
+	t.Run("with initial reads marshals as an object", func(t *testing.T) {
+		data, err := json.Marshal(rpcv10.SimulateTransactionsResponse{
+			SimulatedTransactions: simulated,
+			InitialReads:          &rpcv10.InitialReads{},
+		})
+		require.NoError(t, err)
+		var decoded map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		require.Len(t, decoded, 2)
+		require.Contains(t, decoded, "simulated_transactions")
+		require.Contains(t, decoded, "initial_reads")
+	})
+}
+
+func TestTraceBlockTransactionsResponseMarshalJSON(t *testing.T) {
+	traces := []rpcv10.TracedBlockTransaction{{TransactionHash: felt.NewFromUint64[felt.Felt](9)}}
+
+	t.Run("without initial reads marshals as an array", func(t *testing.T) {
+		data, err := json.Marshal(rpcv10.TraceBlockTransactionsResponse{Traces: traces})
+		require.NoError(t, err)
+		require.JSONEq(t, `[{"transaction_hash":"0x9"}]`, string(data))
+	})
+
+	t.Run("with initial reads marshals as an object", func(t *testing.T) {
+		data, err := json.Marshal(rpcv10.TraceBlockTransactionsResponse{
+			Traces:       traces,
+			InitialReads: &rpcv10.InitialReads{},
+		})
+		require.NoError(t, err)
+		var decoded map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(data, &decoded))
+		require.Len(t, decoded, 2)
+		require.JSONEq(t, `[{"transaction_hash":"0x9"}]`, string(decoded["traces"]))
+		require.Contains(t, decoded, "initial_reads")
+	})
 }

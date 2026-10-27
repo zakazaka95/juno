@@ -9,18 +9,17 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/NethermindEth/juno/blockchain"
+	"github.com/NethermindEth/juno/adapters/adaptfeeder/adaptfeedertest"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
 	"github.com/NethermindEth/juno/core"
 	"github.com/NethermindEth/juno/core/felt"
-	statetestutils "github.com/NethermindEth/juno/core/state/testutils"
 	"github.com/NethermindEth/juno/core/trie"
 	"github.com/NethermindEth/juno/db"
 	"github.com/NethermindEth/juno/db/memory"
-	"github.com/NethermindEth/juno/encoder"
 	"github.com/NethermindEth/juno/l1/eth"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
+	"github.com/NethermindEth/juno/migration/blocktransactions/txlayout"
+	"github.com/NethermindEth/juno/utils/cbor"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/bits-and-blooms/bitset"
 	"github.com/stretchr/testify/assert"
@@ -67,7 +66,8 @@ func TestRelocateContractStorageRootKeys(t *testing.T) {
 		exampleBytes := new(felt.Felt).SetUint64(uint64(i)).Bytes()
 
 		// New entry exists.
-		err := txn.Get(db.ContractStorage.Key(exampleBytes[:]), func(data []byte) error {
+		//nolint:staticcheck,nolintlint // old state layout
+		err := txn.Get(db.DeprecatedContractStorage.Key(exampleBytes[:]), func(data []byte) error {
 			require.Equal(
 				t,
 				exampleBytes[:],
@@ -90,32 +90,37 @@ func TestRelocateContractStorageRootKeys(t *testing.T) {
 
 func TestRecalculateBloomFilters(t *testing.T) {
 	testDB := memory.New()
-	chain := blockchain.New(
-		testDB,
-		&networks.Mainnet,
-		blockchain.WithNewState(statetestutils.UseNewState()),
-	)
 	client := feeder.NewTestClient(t, &networks.Mainnet)
-	gw := adaptfeeder.New(client)
 
-	for i := range uint64(3) {
-		b, err := gw.BlockByNumber(t.Context(), i)
-		require.NoError(t, err)
-		su, err := gw.StateUpdate(t.Context(), i)
-		require.NoError(t, err)
+	blocks := make([]*core.Block, 3)
+	require.NoError(t, testDB.Write(func(txn db.Batch) error {
+		for i := range uint64(len(blocks)) {
+			b := adaptfeedertest.Block(t, client, i)
+			blocks[i] = b
 
-		b.EventsBloom = nil
-		require.NoError(t, chain.Store(b, &core.BlockCommitments{}, su, nil))
-	}
+			// Seed what the migration reads: receipts in the legacy per-transaction
+			// layout, and a bloom-less header. The current core.Header shares the
+			// deprecated header's field-keyed CBOR layout, so getDeprecatedBlockHeader
+			// reads it back with EventsBloom unset — the pre-migration state.
+			require.NoError(t, txlayout.TransactionLayoutPerTx.WriteTransactionsAndReceipts(
+				txn, i, b.Transactions, b.Receipts,
+			))
+			require.NoError(t, core.WriteBlockHeaderByNumber(txn, b.Header))
+		}
+		return nil
+	}))
 
+	// recalculateBloomFilters recomputes each header's embedded bloom from
+	// receipts and writes it back in the legacy (bloom-carrying) layout, since
+	// it runs before the bloom is stripped out of headers.
 	require.NoError(t, testDB.Update(func(txn db.IndexedBatch) error {
 		return recalculateBloomFilters(txn, &networks.Mainnet)
 	}))
 
-	for i := range uint64(3) {
-		b, err := chain.BlockByNumber(i)
+	for i := range uint64(len(blocks)) {
+		header, err := getDeprecatedBlockHeader(testDB, i)
 		require.NoError(t, err)
-		assert.Equal(t, core.EventsBloom(b.Receipts), b.EventsBloom)
+		assert.Equal(t, core.EventsBloom(blocks[i].Receipts), header.EventsBloom)
 	}
 }
 
@@ -144,7 +149,10 @@ func TestRemovePending(t *testing.T) {
 func TestChangeTrieNodeEncoding(t *testing.T) {
 	testdb := memory.New()
 
-	buckets := []db.Bucket{db.ClassesTrie, db.StateTrie, db.ContractStorage}
+	buckets := []db.Bucket{
+		//nolint:staticcheck,nolintlint // old state layout
+		db.DeprecatedClassesTrie, db.DeprecatedStateTrie, db.DeprecatedContractStorage,
+	}
 
 	var n struct {
 		Value *felt.Felt
@@ -154,15 +162,20 @@ func TestChangeTrieNodeEncoding(t *testing.T) {
 	require.NoError(t, testdb.Update(func(txn db.IndexedBatch) error {
 		// contract root keys, if changeTrieNodeEncoding tries to migrate these it
 		// will fail with an error since they are not valid trie.Node encodings.
-		require.NoError(t, txn.Put(db.ClassesTrie.Key(), []byte{1, 2, 3}))
-		require.NoError(t, txn.Put(db.StateTrie.Key(), []byte{1, 2, 3}))
-		require.NoError(t, txn.Put(db.ContractStorage.Key(make([]byte, felt.Bytes)), []byte{1, 2, 3}))
+		//nolint:staticcheck,nolintlint // old state layout
+		require.NoError(t, txn.Put(db.DeprecatedClassesTrie.Key(), []byte{1, 2, 3}))
+		//nolint:staticcheck,nolintlint // old state layout
+		require.NoError(t, txn.Put(db.DeprecatedStateTrie.Key(), []byte{1, 2, 3}))
+		require.NoError(
+			//nolint:staticcheck,nolintlint // old state layout
+			t, txn.Put(db.DeprecatedContractStorage.Key(make([]byte, felt.Bytes)), []byte{1, 2, 3}),
+		)
 
 		for _, bucket := range buckets {
 			for i := range 5 {
 				n.Value = new(felt.Felt).SetUint64(uint64(i))
 
-				encodedNode, err := encoder.Marshal(n)
+				encodedNode, err := cbor.Marshal(n)
 				if err != nil {
 					return err
 				}
@@ -201,13 +214,10 @@ func TestCalculateBlockCommitments(t *testing.T) {
 		&networks.Mainnet,
 	)
 	client := feeder.NewTestClient(t, &networks.Mainnet)
-	gw := adaptfeeder.New(client)
 
 	for i := range uint64(3) {
-		b, err := gw.BlockByNumber(t.Context(), i)
-		require.NoError(t, err)
-		su, err := gw.StateUpdate(t.Context(), i)
-		require.NoError(t, err)
+		b := adaptfeedertest.Block(t, client, i)
+		su := adaptfeedertest.StateUpdate(t, client, i)
 		require.NoError(t, state.Store(b, &core.BlockCommitments{}, su, nil))
 	}
 
@@ -228,13 +238,10 @@ func TestL1HandlerTxns(t *testing.T) {
 		&networks.Sepolia,
 	)
 	client := feeder.NewTestClient(t, &networks.Sepolia)
-	gw := adaptfeeder.New(client)
 
 	for i := range uint64(7) { // First l1 handler txn is in block 6
-		b, err := gw.BlockByNumber(t.Context(), i)
-		require.NoError(t, err)
-		su, err := gw.StateUpdate(t.Context(), i)
-		require.NoError(t, err)
+		b := adaptfeedertest.Block(t, client, i)
+		su := adaptfeedertest.StateUpdate(t, client, i)
 		require.NoError(t, state.Store(b, &core.BlockCommitments{}, su, nil))
 	}
 
@@ -341,7 +348,7 @@ func TestMigrateCairo1CompiledClass(t *testing.T) {
 		},
 	} {
 		expectedDeclared.Class.Compiled = json.RawMessage(test.compiledJSON)
-		classBytes, err := encoder.Marshal(expectedDeclared)
+		classBytes, err := cbor.Marshal(expectedDeclared)
 		require.NoError(t, err)
 		err = txn.Put(key, classBytes)
 		require.NoError(t, err)
@@ -350,7 +357,7 @@ func TestMigrateCairo1CompiledClass(t *testing.T) {
 
 		var actualDeclared core.DeclaredClassDefinition
 		err = txn.Get(key, func(data []byte) error {
-			return encoder.Unmarshal(data, &actualDeclared)
+			return cbor.Unmarshal(data, &actualDeclared)
 		})
 		require.NoError(t, err)
 
@@ -374,7 +381,8 @@ func TestMigrateCairo1CompiledClass(t *testing.T) {
 }
 
 func TestMigrateTrieNodesFromBitsetToBitArray(t *testing.T) {
-	migrator := migrateTrieNodesFromBitsetToTrieKey(db.ClassesTrie)
+	//nolint:staticcheck,nolintlint // old state layout
+	migrator := migrateTrieNodesFromBitsetToTrieKey(db.DeprecatedClassesTrie)
 	memDB := memory.New()
 	memTxn := memDB.NewIndexedBatch()
 
@@ -393,13 +401,15 @@ func TestMigrateTrieNodesFromBitsetToBitArray(t *testing.T) {
 	require.True(t, wrote > 0)
 	require.NoError(t, err)
 
-	nodeKey := db.ClassesTrie.Key(bsBytes)
+	//nolint:staticcheck,nolintlint // old state layout
+	nodeKey := db.DeprecatedClassesTrie.Key(bsBytes)
 	err = memTxn.Put(nodeKey, nodeBytes.Bytes())
 	require.NoError(t, err)
 
 	require.NoError(t, migrator(memTxn, nodeKey, nodeBytes.Bytes(), &networks.Mainnet))
 
-	err = memTxn.Get(db.ClassesTrie.Key(bsBytes), func([]byte) error { return nil })
+	//nolint:staticcheck,nolintlint // old state layout
+	err = memTxn.Get(db.DeprecatedClassesTrie.Key(bsBytes), func([]byte) error { return nil })
 	require.ErrorIs(t, err, db.ErrKeyNotFound)
 
 	var nodeKeyBuf bytes.Buffer
@@ -678,7 +688,7 @@ func TestChangeStateDiffStruct(t *testing.T) {
 				ReplacedClasses:   []oldAddressClassHashPair{{Address: felt.NewUnsafeFromString[felt.Felt]("0x13"), ClassHash: felt.NewUnsafeFromString[felt.Felt]("0x14")}},
 			},
 		}
-		su0Bytes, err := encoder.Marshal(su0)
+		su0Bytes, err := cbor.Marshal(su0)
 		require.NoError(t, err)
 		require.NoError(t, txn.Put(su0Key, su0Bytes))
 
@@ -703,7 +713,7 @@ func TestChangeStateDiffStruct(t *testing.T) {
 				ReplacedClasses:   []oldAddressClassHashPair{{Address: felt.NewUnsafeFromString[felt.Felt]("0x28"), ClassHash: felt.NewUnsafeFromString[felt.Felt]("0x29")}},
 			},
 		}
-		su1Bytes, err := encoder.Marshal(su1)
+		su1Bytes, err := cbor.Marshal(su1)
 		require.NoError(t, err)
 		require.NoError(t, txn.Put(su1Key, su1Bytes))
 		return nil
@@ -798,7 +808,7 @@ func TestChangeStateDiffStruct(t *testing.T) {
 		value, err := iter.Value()
 		require.NoError(t, err)
 		got := new(core.StateUpdate)
-		require.NoError(t, encoder.Unmarshal(value, got))
+		require.NoError(t, cbor.Unmarshal(value, got))
 		require.Equal(t, update.want, got)
 	}
 	require.False(t, iter.Next())

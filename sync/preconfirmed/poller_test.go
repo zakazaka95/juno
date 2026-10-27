@@ -1,8 +1,8 @@
 package preconfirmed_test
 
 import (
-	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -10,12 +10,11 @@ import (
 
 	"github.com/NethermindEth/juno/blockchain"
 	"github.com/NethermindEth/juno/blockchain/networks"
+	"github.com/NethermindEth/juno/clients/feeder"
 	"github.com/NethermindEth/juno/core"
 	"github.com/NethermindEth/juno/core/felt"
-	"github.com/NethermindEth/juno/core/pending"
 	"github.com/NethermindEth/juno/db"
 	"github.com/NethermindEth/juno/db/memory"
-	"github.com/NethermindEth/juno/feed"
 	"github.com/NethermindEth/juno/mocks"
 	"github.com/NethermindEth/juno/starknet"
 	"github.com/NethermindEth/juno/sync/preconfirmed"
@@ -26,7 +25,11 @@ import (
 
 var feltOne = &felt.One
 
-const tickInterval = 100 * time.Millisecond
+const (
+	tickInterval = 100 * time.Millisecond
+	staleAfter   = 100 * time.Millisecond
+	onDemandWait = time.Second
+)
 
 // makeTestPreConfirmedBlock returns a starknet.PreConfirmedBlock carrying
 // `txCount` synthesised invoke transactions with matching receipts and per-tx
@@ -140,43 +143,47 @@ func (f *chainFixture) advanceHead(t *testing.T) *core.Header {
 	return next
 }
 
+// harness is a poller wired against a blockchain and a DataSource, plus the
+// highest-known header its atTip gate reads.
 type harness struct {
 	poller  *preconfirmed.Poller
-	storage *preconfirmed.ChainStorage
-	head    *core.Header
 	highest *atomic.Pointer[core.Header]
-	sub     *feed.Subscription[*pending.PreConfirmed]
 }
 
-// wirePoller creates the in-memory bits (storage, feed, atomic header, poller)
-// against an already-constructed blockchain and DataSource.
+// wirePoller builds a poller against an already-constructed blockchain and
+// DataSource. The highest-known header starts at head, so the poller is at tip
+// unless a test moves it. opts override the package's tick interval, staleAfter
+// and onDemandWait; later options win.
 func wirePoller(
 	t *testing.T,
 	bc *blockchain.Blockchain,
 	head *core.Header,
 	ds preconfirmed.DataSource,
+	opts ...preconfirmed.Option,
 ) harness {
 	t.Helper()
-	storage := preconfirmed.NewChainStorage()
-	out := feed.New[*pending.PreConfirmed]()
-	sub := out.SubscribeKeepLast()
-	t.Cleanup(sub.Unsubscribe)
-
 	highest := &atomic.Pointer[core.Header]{}
 	highest.Store(head)
 
-	p := preconfirmed.NewPoller(ds, storage, bc, out, highest, tickInterval, log.NewNopZapLogger())
-	return harness{
-		poller:  p,
-		storage: storage,
-		head:    head,
-		highest: highest,
-		sub:     sub,
-	}
+	opts = append([]preconfirmed.Option{
+		preconfirmed.WithPollInterval(tickInterval),
+		preconfirmed.WithStaleAfter(staleAfter),
+		preconfirmed.WithOnDemandWait(onDemandWait),
+	}, opts...)
+	p := preconfirmed.NewPoller(ds, bc, highest, log.NewNopZapLogger(), opts...)
+	return harness{poller: p, highest: highest}
 }
 
-// expectedEntry describes one slot of an expected chain snapshot. Used by
-// assertChain to pin down the full storage state after a tick.
+// readChain reads the poller's current pre-confirmed view the way any consumer does.
+func (h harness) readChain(t *testing.T) preconfirmed.ChainReader {
+	t.Helper()
+	view, err := h.poller.RequestPreConfirmedChain()
+	require.NoError(t, err)
+	return view
+}
+
+// expectedEntry describes one slot of an expected chain view. Used by
+// assertChain to pin down the full chain after a tick.
 type expectedEntry struct {
 	number     uint64
 	identifier string
@@ -199,7 +206,16 @@ func entry(
 	return expectedEntry{number, block.BlockIdentifier, txCount}
 }
 
-// assertChain pins down a snapshot's full contents in oldest-first order.
+// blankEntry describes the placeholder ReadPreConfirmedChain returns while nothing
+// has been polled for the slot above the canonical head: an empty block carrying
+// the blank identifier.
+//
+//nolint:unparam // number is 1 all the time by chance
+func blankEntry(number uint64) expectedEntry {
+	return expectedEntry{number: number, identifier: feeder.PreConfirmedBlankIdentifier, txCount: 0}
+}
+
+// assertChain pins down a chain view's full contents in oldest-first order.
 // Catches off-by-one length mistakes, identifier preservation/replacement,
 // and tx-count merges that a head-only check would silently miss.
 func assertChain(t *testing.T, snap *preconfirmed.ChainReader, want ...expectedEntry) {
@@ -207,15 +223,15 @@ func assertChain(t *testing.T, snap *preconfirmed.ChainReader, want ...expectedE
 	require.NotNil(t, snap, "snapshot must be non-nil")
 	require.Equal(t, len(want), snap.Length(), "chain length")
 	i := 0
-	for pc := range snap.OldestFirst() {
-		require.Equal(t, want[i].number, pc.Block.Number, "entry %d block number", i)
-		require.Equal(t, want[i].identifier, pc.BlockIdentifier, "entry %d identifier", i)
-		require.Equal(t, want[i].txCount, len(pc.Block.Transactions), "entry %d tx count", i)
+	for preConf := range snap.OldestFirst() {
+		require.Equal(t, want[i].number, preConf.Block.Number, "entry %d block number", i)
+		require.Equal(t, want[i].identifier, preConf.BlockIdentifier, "entry %d identifier", i)
+		require.Equal(t, want[i].txCount, len(preConf.Block.Transactions), "entry %d tx count", i)
 		i++
 	}
 }
 
-// Empty storage, sequencer at head+1: tick polls latest once and bootstraps
+// Nothing polled yet, sequencer at head+1: tick polls latest once and bootstraps
 // the chain — no backfill needed.
 func TestPollerColdBootstrapNoGap(t *testing.T) {
 	t.Parallel()
@@ -224,23 +240,23 @@ func TestPollerColdBootstrapNoGap(t *testing.T) {
 	block1 := makeTestPreConfirmedBlock("r0", 1)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
 	ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
 		Return(block1, uint64(1), nil)
 
 	synctest.Test(t, func(t *testing.T) {
-		h := wirePoller(t, fx.bc, fx.head, ds)
-		go h.poller.Run(t.Context())
+		harness := wirePoller(t, fx.bc, fx.head, ds)
+		go harness.poller.Run(t.Context())
 		synctest.Wait()
 		time.Sleep(tickInterval)
 		synctest.Wait()
 
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+		view := harness.readChain(t)
 		assertChain(t, &view, entry(1, &block1))
 	})
 }
 
-// Empty storage, sequencer several blocks ahead of head: backfill walks the
+// Nothing polled yet, sequencer several blocks ahead of head: backfill walks the
 // intermediate heights with blank hints before applying the latest.
 func TestPollerColdBootstrapWithGap(t *testing.T) {
 	t.Parallel()
@@ -251,7 +267,7 @@ func TestPollerColdBootstrapWithGap(t *testing.T) {
 	block3 := makeTestPreConfirmedBlock("r3", 0)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
 	gomock.InOrder(
 		ds.EXPECT().
 			PreConfirmedBlockLatest(gomock.Any(), gomock.Any(), gomock.Any()).
@@ -272,7 +288,7 @@ func TestPollerColdBootstrapWithGap(t *testing.T) {
 		time.Sleep(tickInterval)
 		synctest.Wait()
 
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+		view := h.readChain(t)
 		assertChain(t, &view,
 			entry(1, &block1),
 			entry(2, &block2),
@@ -281,8 +297,9 @@ func TestPollerColdBootstrapWithGap(t *testing.T) {
 	})
 }
 
-// Empty blockchain (pre-genesis): Run stalls without touching the data source.
-// Once the genesis block lands, the next tick bootstraps the chain as usual.
+// Empty blockchain (pre-genesis): Run stalls without touching the data source,
+// and there is no pre-confirmed chain to read. Once the genesis block lands, the
+// next tick bootstraps the chain as usual.
 func TestPollerStallsUntilGenesis(t *testing.T) {
 	t.Parallel()
 
@@ -298,38 +315,43 @@ func TestPollerStallsUntilGenesis(t *testing.T) {
 	block1 := makeTestPreConfirmedBlock("r0", 1)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+	// Registered before the bubble starts: gomock expectations must not be added
+	// while the poller goroutine is live (Return writes the call unlocked, which
+	// the race detector flags). Times(1) by default, so a poll before genesis
+	// would consume it and fail the post-genesis tick with an unexpected call.
+	ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+		Return(block1, uint64(1), nil)
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, bc, genesis, ds)
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
-		// Pre-genesis ticks: no expectations are registered on the mock yet, so
-		// any data-source call fails the test. Storage must stay empty.
+		// Pre-genesis ticks: the poller stalls on its height guard. Reading the
+		// chain fails the same way that guard does.
 		time.Sleep(3 * tickInterval)
 		synctest.Wait()
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(genesis.Number))
-		assertChain(t, &view)
+		_, err := h.poller.RequestPreConfirmedChain()
+		require.ErrorIs(t, err, db.ErrKeyNotFound)
 
-		// Genesis lands; the poll expectation only exists from here on.
+		// Genesis lands.
 		require.NoError(t, core.WriteBlockHeaderByNumber(testDB, genesis))
 		require.NoError(t, core.WriteChainHeight(testDB, 0))
-		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
-			Return(block1, uint64(1), nil)
 
 		// One interval for the guard to observe the new head, one more for the
 		// first real polling tick.
 		time.Sleep(2 * tickInterval)
 		synctest.Wait()
 
-		view = h.storage.SnapshotForBlock(oldestPreConfFor(genesis.Number))
+		view := h.readChain(t)
 		assertChain(t, &view, entry(1, &block1))
 	})
 }
 
-// mostRecent already at target height and server returns NoChange: tick is a
-// pure no-op — no backfill, no apply, storage pointer unchanged.
+// The chain tip is already at the server's height and the server returns
+// NoChange: the tick is a pure no-op — no backfill poll, and the chain reads
+// back unchanged.
 func TestPollerSameHeightNoBackfill(t *testing.T) {
 	t.Parallel()
 	fx := newChainFixture(t)
@@ -337,31 +359,38 @@ func TestPollerSameHeightNoBackfill(t *testing.T) {
 	seed := makeTestPreConfirmedBlock("r0", 0)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
-	ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r0", uint64(0)).
-		Return(starknet.PreConfirmedNoChange{}, uint64(1), nil)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+	gomock.InOrder(
+		// Tick 1: seed the chain through the wire.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(seed, uint64(1), nil),
+		// Tick 2: same height, nothing new. No PreConfirmedBlockByNumber is
+		// expected, so a backfill poll would fail the test.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r0", uint64(0)).
+			Return(starknet.PreConfirmedNoChange{}, uint64(1), nil),
+	)
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, fx.bc, fx.head, ds)
-		_, err := h.storage.ApplyUpdate(seed, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-		before := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
-
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
+		// Tick 1.
 		time.Sleep(tickInterval)
 		synctest.Wait()
+		view := h.readChain(t)
+		assertChain(t, &view, entry(1, &seed))
 
-		after := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
-		require.Same(t, before.Head(), after.Head(),
-			"NoChange must leave the chain pointer unchanged")
-		assertChain(t, &after, entry(1, &seed))
+		// Tick 2.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		view = h.readChain(t)
+		assertChain(t, &view, entry(1, &seed))
 	})
 }
 
-// mostRecent at target height and server returns a Delta enriching that
-// block: no backfill, apply merges the delta into the same slot, the stored
+// The chain tip is at the server's height and the server returns a Delta
+// enriching that block: no backfill, the delta merges into the same slot, the
 // chain still has length 1 but with the appended transactions visible.
 func TestPollerSameHeightDeltaAppliesToSlot(t *testing.T) {
 	t.Parallel()
@@ -371,29 +400,36 @@ func TestPollerSameHeightDeltaAppliesToSlot(t *testing.T) {
 	delta := makeTestDelta("r0", 2)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
-	// Delta hint matches mostRecent: identifier="r0", txCount=0.
-	ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r0", uint64(0)).
-		Return(delta, uint64(1), nil)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+	gomock.InOrder(
+		// Tick 1: seed the chain through the wire.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(seed, uint64(1), nil),
+		// Tick 2: delta hint matches the seeded tip: identifier="r0", txCount=0.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r0", uint64(0)).
+			Return(delta, uint64(1), nil),
+	)
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, fx.bc, fx.head, ds)
-		_, err := h.storage.ApplyUpdate(seed, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
+		// Tick 1.
 		time.Sleep(tickInterval)
 		synctest.Wait()
+		view := h.readChain(t)
+		assertChain(t, &view, entry(1, &seed))
 
-		// Delta preserves seed.identifier and appends its own txs to seed's.
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+		// Tick 2: delta preserves seed.identifier and appends its own txs to seed's.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		view = h.readChain(t)
 		assertChain(t, &view, entry(1, &seed, &delta))
 	})
 }
 
-// Sequencer advanced by exactly one: backfill re-polls mostRecent's own height with its
+// Sequencer advanced by exactly one: backfill re-polls the tip's own height with its
 // identifier+txCount hints, and the server replies with a Delta carrying the final txs
 // appended before the next block. The delta merges into the existing slot (identifier
 // preserved, txs summed), then the new most recent is applied.
@@ -406,29 +442,35 @@ func TestPollerForwardJumpFinalisesMostRecent(t *testing.T) {
 	block2 := makeTestPreConfirmedBlock("r1", 0)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
 	gomock.InOrder(
-		ds.EXPECT().
-			PreConfirmedBlockLatest(gomock.Any(), gomock.Any(), gomock.Any()).
+		// Tick 1: seed block 1.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(seed, uint64(1), nil),
+		// Tick 2: the sequencer moved on to block 2.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r0", uint64(0)).
 			Return(block2, uint64(2), nil),
 		// Finalise poll: server replies with a Delta keyed off the stored
 		// identifier+txCount; carries any txs appended since.
-		ds.EXPECT().
-			PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "r0", uint64(0)).
+		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "r0", uint64(0)).
 			Return(finaliseDelta, nil),
 	)
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, fx.bc, fx.head, ds)
-		_, err := h.storage.ApplyUpdate(seed, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
+		// Tick 1.
 		time.Sleep(tickInterval)
 		synctest.Wait()
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+		view := h.readChain(t)
+		assertChain(t, &view, entry(1, &seed))
+
+		// Tick 2.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		view = h.readChain(t)
 		assertChain(t, &view,
 			entry(1, &seed, &finaliseDelta), // seed + delta merged at block 1
 			entry(2, &block2),
@@ -436,7 +478,7 @@ func TestPollerForwardJumpFinalisesMostRecent(t *testing.T) {
 	})
 }
 
-// Sequencer jumped multiple blocks ahead: backfill finalises mostRecent and
+// Sequencer jumped multiple blocks ahead: backfill finalises the old tip and
 // then walks every intermediate height with blank hints before applying the
 // new most recent.
 func TestPollerLargeJumpWalksGap(t *testing.T) {
@@ -450,36 +492,39 @@ func TestPollerLargeJumpWalksGap(t *testing.T) {
 	block4 := makeTestPreConfirmedBlock("r4", 0)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
 	gomock.InOrder(
-		ds.EXPECT().
-			PreConfirmedBlockLatest(gomock.Any(), gomock.Any(), gomock.Any()).
+		// Tick 1: seed block 1.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(seed, uint64(1), nil),
+		// Tick 2: the sequencer is at block 4.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r0", uint64(0)).
 			Return(block4, uint64(4), nil),
-		// Finalise mostRecent (1) with delta hints.
-		ds.EXPECT().
-			PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "r0", uint64(0)).
+		// Finalise the old tip (1) with delta hints.
+		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "r0", uint64(0)).
 			Return(finaliseReply, nil),
 		// Walk intermediate blocks 2, 3 with blank hints.
-		ds.EXPECT().
-			PreConfirmedBlockByNumber(gomock.Any(), uint64(2), "", uint64(0)).
+		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(2), "", uint64(0)).
 			Return(block2, nil),
-		ds.EXPECT().
-			PreConfirmedBlockByNumber(gomock.Any(), uint64(3), "", uint64(0)).
+		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(3), "", uint64(0)).
 			Return(block3, nil),
 	)
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, fx.bc, fx.head, ds)
-		_, err := h.storage.ApplyUpdate(seed, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
+		// Tick 1.
 		time.Sleep(tickInterval)
 		synctest.Wait()
+		view := h.readChain(t)
+		assertChain(t, &view, entry(1, &seed))
 
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+		// Tick 2.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		view = h.readChain(t)
 		assertChain(t, &view,
 			entry(1, &seed), // identifier preserved by finalise
 			entry(2, &block2),
@@ -490,70 +535,136 @@ func TestPollerLargeJumpWalksGap(t *testing.T) {
 }
 
 // highestBlockHeader sits above head (canonical sync is still catching up):
-// the atTip gate short-circuits the tick before any wire call.
+// the atTip gate short-circuits the tick before any wire call, and the chain
+// stays at the blank placeholder.
 func TestPollerNotAtTipSkipsAllWork(t *testing.T) {
 	t.Parallel()
 	fx := newChainFixture(t)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
 	// No expectations set: any wire call fails the test.
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, fx.bc, fx.head, ds)
-		h.highest.Store(&core.Header{Number: h.head.Number + 5}) // not at tip
+		h.highest.Store(&core.Header{Number: fx.head.Number + 5}) // not at tip
 
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
 		time.Sleep(tickInterval)
 		synctest.Wait()
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
-		require.Zero(t, view.Length())
+		view := h.readChain(t)
+		assertChain(t, &view, blankEntry(1))
 	})
 }
 
-// PreConfirmedBlockLatest errors: tick aborts immediately, no backfill or apply,
-// storage stays empty for the next tick to retry from scratch.
+// pollFailures are data source errors that fail a pre-confirmed poll.
+var pollFailures = []struct {
+	name string
+	err  error
+}{
+	{name: "wire error", err: errors.New("wire boom")},
+	{name: "rate limited", err: fmt.Errorf("querying: %w", feeder.ErrRateLimited)},
+}
+
+// PreConfirmedBlockLatest errors: tick aborts immediately, no backfill or apply;
+// nothing is stored, so the next tick retries from scratch.
 func TestPollerLatestErrorSkipsApply(t *testing.T) {
 	t.Parallel()
-	fx := newChainFixture(t)
+	for _, tc := range pollFailures {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fx := newChainFixture(t)
 
-	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
-	ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(nil, uint64(0), errors.New("wire boom"))
+			ctrl := gomock.NewController(t)
+			ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+			// Once for the tick and once for reading the chain: the failed tick leaves the
+			// chain outdated, so the read asks for a new poll, which fails the same way.
+			ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(nil, uint64(0), tc.err).
+				Times(2)
 
-	synctest.Test(t, func(t *testing.T) {
-		h := wirePoller(t, fx.bc, fx.head, ds)
-		go h.poller.Run(t.Context())
-		synctest.Wait()
+			synctest.Test(t, func(t *testing.T) {
+				h := wirePoller(t, fx.bc, fx.head, ds)
+				go h.poller.Run(t.Context())
+				synctest.Wait()
 
-		time.Sleep(tickInterval)
-		synctest.Wait()
+				time.Sleep(tickInterval)
+				synctest.Wait()
 
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
-		require.Zero(t, view.Length(), "latest error must not produce any storage state")
-	})
+				// A latest error must not produce any chain state.
+				view := h.readChain(t)
+				assertChain(t, &view, blankEntry(1))
+			})
+		})
+	}
 }
 
 // backfill's per-block poll errors mid-gap: tick aborts before the final apply
-// at target, so storage remains empty (next tick reconciles).
+// at target, so nothing is stored (next tick reconciles).
 func TestPollerBackfillErrorSkipsApply(t *testing.T) {
+	t.Parallel()
+	for _, tc := range pollFailures {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fx := newChainFixture(t)
+
+			latestReply := makeTestPreConfirmedBlock("r3", 0)
+
+			ctrl := gomock.NewController(t)
+			ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+			gomock.InOrder(
+				// Tick 1.
+				ds.EXPECT().
+					PreConfirmedBlockLatest(gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(latestReply, uint64(3), nil),
+				ds.EXPECT().
+					PreConfirmedBlockByNumber(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(nil, tc.err),
+				// Reading the chain: the failed tick leaves it outdated, so the read asks for a
+				// new poll, which fails the same way.
+				ds.EXPECT().
+					PreConfirmedBlockLatest(gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(latestReply, uint64(3), nil),
+				ds.EXPECT().
+					PreConfirmedBlockByNumber(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					Return(nil, tc.err),
+			)
+
+			synctest.Test(t, func(t *testing.T) {
+				h := wirePoller(t, fx.bc, fx.head, ds)
+				go h.poller.Run(t.Context())
+				synctest.Wait()
+
+				time.Sleep(tickInterval)
+				synctest.Wait()
+
+				// The tick aborts before any apply when backfill errors.
+				view := h.readChain(t)
+				assertChain(t, &view, blankEntry(1))
+			})
+		})
+	}
+}
+
+// The gateway answering 400 to a pre-confirmed poll surfaces as
+// feeder.ErrPreConfirmedBlockNotFound; the tick treats it as "the window is
+// empty — nothing to do": it stores nothing, and the next tick picks up the
+// window normally once it opens.
+func TestPollerLatestNotFoundSkipsTickAndRecovers(t *testing.T) {
 	t.Parallel()
 	fx := newChainFixture(t)
 
-	latestReply := makeTestPreConfirmedBlock("r3", 0)
+	block1 := makeTestPreConfirmedBlock("r1", 0)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
 	gomock.InOrder(
-		ds.EXPECT().
-			PreConfirmedBlockLatest(gomock.Any(), gomock.Any(), gomock.Any()).
-			Return(latestReply, uint64(3), nil),
-		ds.EXPECT().
-			PreConfirmedBlockByNumber(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			Return(nil, errors.New("backfill boom")),
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(nil, uint64(0), fmt.Errorf("querying: %w", feeder.ErrPreConfirmedBlockNotFound)),
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(block1, uint64(1), nil),
 	)
 
 	synctest.Test(t, func(t *testing.T) {
@@ -561,17 +672,85 @@ func TestPollerBackfillErrorSkipsApply(t *testing.T) {
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
+		// Tick 1: nothing in the pre-confirmed window — the tick is a no-op.
 		time.Sleep(tickInterval)
 		synctest.Wait()
+		view := h.readChain(t)
+		assertChain(t, &view, blankEntry(1))
 
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
-		require.Zero(t, view.Length(), "tick aborts before any apply when backfill errors")
+		// Tick 2: the window opened; polling proceeds normally.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		view = h.readChain(t)
+		assertChain(t, &view, entry(1, &block1))
+	})
+}
+
+// A block that left the pre-confirmed window mid-backfill surfaces as
+// feeder.ErrPreConfirmedBlockNotFound through backfill's wrapping; the tick
+// abandons the rest of the fill — nothing is applied, not even the already
+// fetched latest — and the next tick reconciles the whole gap from scratch.
+func TestPollerBackfillNotFoundSkipsApplyAndRecovers(t *testing.T) {
+	t.Parallel()
+	fx := newChainFixture(t)
+
+	block1 := makeTestPreConfirmedBlock("r1", 0)
+	block2 := makeTestPreConfirmedBlock("r2", 0)
+	latestReply := makeTestPreConfirmedBlock("r3", 0)
+
+	ctrl := gomock.NewController(t)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+	// Exactly-once, in-order expectations double as a behavioral pin: a tick
+	// that kept backfilling past the not-found would consume tick 2's
+	// expectations early and fail the script.
+	gomock.InOrder(
+		// Tick 1: latest says 3, but block 1 already left the window.
+		ds.EXPECT().
+			PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(latestReply, uint64(3), nil),
+		ds.EXPECT().
+			PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "", uint64(0)).
+			Return(nil, fmt.Errorf(
+				"polling pre-confirmed for number 1: %w", feeder.ErrPreConfirmedBlockNotFound,
+			)),
+		// Tick 2: nothing was stored, so the poller re-walks the full gap.
+		ds.EXPECT().
+			PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(latestReply, uint64(3), nil),
+		ds.EXPECT().
+			PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "", uint64(0)).
+			Return(block1, nil),
+		ds.EXPECT().
+			PreConfirmedBlockByNumber(gomock.Any(), uint64(2), "", uint64(0)).
+			Return(block2, nil),
+	)
+
+	synctest.Test(t, func(t *testing.T) {
+		h := wirePoller(t, fx.bc, fx.head, ds)
+		go h.poller.Run(t.Context())
+		synctest.Wait()
+
+		// Tick 1: the mid-fill not-found aborts the tick before any apply.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		view := h.readChain(t)
+		assertChain(t, &view, blankEntry(1))
+
+		// Tick 2: the full gap backfills and the latest lands on top.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		view = h.readChain(t)
+		assertChain(t, &view,
+			entry(1, &block1),
+			entry(2, &block2),
+			entry(3, &latestReply),
+		)
 	})
 }
 
 // Across three consecutive ticks the sequencer advances one block at a time:
-// each tick finalises the prior mostRecent and lands a new most recent, so the
-// chain grows monotonically from 1 to 3 entries.
+// each tick finalises the prior tip and lands a new most recent, so the chain
+// grows monotonically from 1 to 3 entries.
 func TestPollerMultiTickExtendsChain(t *testing.T) {
 	t.Parallel()
 	fx := newChainFixture(t)
@@ -581,7 +760,7 @@ func TestPollerMultiTickExtendsChain(t *testing.T) {
 	block3 := makeTestPreConfirmedBlock("r3", 0)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
 	// Script every wire call across the three ticks in chronological order.
 	// Finalise polls return the same block already at that slot so
 	// shouldPreserveSlot keeps the entry instead of replacing it.
@@ -609,13 +788,13 @@ func TestPollerMultiTickExtendsChain(t *testing.T) {
 		// Tick 1.
 		time.Sleep(tickInterval)
 		synctest.Wait()
-		view1 := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+		view1 := h.readChain(t)
 		assertChain(t, &view1, entry(1, &block1))
 
 		// Tick 2.
 		time.Sleep(tickInterval)
 		synctest.Wait()
-		view2 := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+		view2 := h.readChain(t)
 		assertChain(t, &view2,
 			entry(1, &block1),
 			entry(2, &block2),
@@ -624,7 +803,7 @@ func TestPollerMultiTickExtendsChain(t *testing.T) {
 		// Tick 3.
 		time.Sleep(tickInterval)
 		synctest.Wait()
-		view3 := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+		view3 := h.readChain(t)
 		assertChain(t, &view3,
 			entry(1, &block1),
 			entry(2, &block2),
@@ -633,55 +812,60 @@ func TestPollerMultiTickExtendsChain(t *testing.T) {
 	})
 }
 
-// Canonical head advances past one of the stored pre_confirmed entries:
-// AdvanceTo at the top of tick drops the now-committed entry from the chain,
-// leaving only entries that are still above the new head.
+// Canonical head advances past one of the stored pre_confirmed entries: the
+// next tick realigns the chain to the new head, dropping the now-committed
+// entry and leaving only entries that are still above it.
 func TestPollerHeadAdvancesDropsCommittedEntries(t *testing.T) {
 	t.Parallel()
 	fx := newChainFixture(t)
 
-	seed1 := makeTestPreConfirmedBlock("r1", 0) // will be dropped after head advances past it
+	seed1 := makeTestPreConfirmedBlock("r1", 0) // dropped once head advances past it
 	seed2 := makeTestPreConfirmedBlock("r2", 0)
 
-	var latestBlockNumber atomic.Uint64
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
-	ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(context.Context, string, uint64) (starknet.PreConfirmedUpdate, uint64, error) {
-			return starknet.PreConfirmedNoChange{}, latestBlockNumber.Load(), nil
-		})
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+	gomock.InOrder(
+		// Tick 1: seed blocks 1 and 2 (latest at 2, backfill walks 1).
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(seed2, uint64(2), nil),
+		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "", uint64(0)).
+			Return(seed1, nil),
+		// Tick 2: head is now 1; the surviving tip (block 2, "r2") is re-polled
+		// unchanged.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r2", uint64(0)).
+			Return(starknet.PreConfirmedNoChange{}, uint64(2), nil),
+	)
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, fx.bc, fx.head, ds)
-		_, err := h.storage.ApplyUpdate(seed1, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-		_, err = h.storage.ApplyUpdate(seed2, h.head.Number+2, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-		before := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
-		require.Equal(t, 2, before.Length())
-
-		// Canonical head advances by one — block head+1 is now committed.
-		newHead := fx.advanceHead(t)
-		h.highest.Store(newHead)
-		latestBlockNumber.Store(newHead.Number + 1)
-
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
+		// Tick 1.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		view := h.readChain(t)
+		assertChain(t, &view, entry(1, &seed1), entry(2, &seed2))
+
+		// Canonical head advances by one — block 1 is now committed.
+		newHead := fx.advanceHead(t)
+		h.highest.Store(newHead)
+
+		// Tick 2.
 		time.Sleep(tickInterval)
 		synctest.Wait()
 
 		// seed1 committed → dropped; only seed2 remains at the new head+1.
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(newHead.Number))
+		view = h.readChain(t)
 		assertChain(t, &view, entry(newHead.Number+1, &seed2))
 	})
 }
 
 // Sequencer rewinds: PreConfirmedBlockLatest reports a height BELOW the chain's
-// current most recent with a new identifier (a new round started at a lower
-// slot). Tick must not backfill (target < fromBlock); apply hits the in-chain
-// replace path which truncates everything above the replaced slot and
-// installs the new block there.
+// current tip with a new identifier (a new round started at a lower slot). Tick
+// must not backfill (target < fromBlock); apply hits the in-chain replace path
+// which truncates everything above the replaced slot and installs the new block
+// there.
 func TestPollerReorgLowerHeightDifferentIdentifier(t *testing.T) {
 	t.Parallel()
 	fx := newChainFixture(t)
@@ -694,30 +878,38 @@ func TestPollerReorgLowerHeightDifferentIdentifier(t *testing.T) {
 	replacement := makeTestPreConfirmedBlock("rZ", 0)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
-	// Hint matches the most recent (block 3, "r3", 0 txs) the poller would carry.
-	ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r3", uint64(0)).
-		Return(replacement, uint64(2), nil)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+	gomock.InOrder(
+		// Tick 1: seed blocks 1..3 (latest at 3, backfill walks 1 and 2).
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(seed3, uint64(3), nil),
+		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "", uint64(0)).
+			Return(seed1, nil),
+		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(2), "", uint64(0)).
+			Return(seed2, nil),
+		// Tick 2: hint carries the tip (block 3, "r3", 0 txs); the server
+		// answers with a new round at block 2.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r3", uint64(0)).
+			Return(replacement, uint64(2), nil),
+	)
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, fx.bc, fx.head, ds)
-		_, err := h.storage.ApplyUpdate(seed1, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-		_, err = h.storage.ApplyUpdate(seed2, h.head.Number+2, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-		_, err = h.storage.ApplyUpdate(seed3, h.head.Number+3, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-		before := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
-		require.Equal(t, 3, before.Length())
-
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
+		// Tick 1.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		view := h.readChain(t)
+		assertChain(t, &view, entry(1, &seed1), entry(2, &seed2), entry(3, &seed3))
+
+		// Tick 2.
 		time.Sleep(tickInterval)
 		synctest.Wait()
 
 		// Block 2 swapped to the new identifier; block 3 truncated.
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+		view = h.readChain(t)
 		assertChain(t, &view,
 			entry(1, &seed1),
 			entry(2, &replacement),
@@ -725,6 +917,8 @@ func TestPollerReorgLowerHeightDifferentIdentifier(t *testing.T) {
 	})
 }
 
+// A new round starts at the tip's own height: the tip is replaced in place and
+// the lower entries are untouched.
 func TestPollerReorgSameHeightDifferentIdentifier(t *testing.T) {
 	t.Parallel()
 	fx := newChainFixture(t)
@@ -732,33 +926,41 @@ func TestPollerReorgSameHeightDifferentIdentifier(t *testing.T) {
 	seed1 := makeTestPreConfirmedBlock("r1", 0)
 	seed2 := makeTestPreConfirmedBlock("r2", 0)
 	seed3 := makeTestPreConfirmedBlock("r3", 0)
-	// New round at the same slot — different identifier replaces the most recent.
+	// New round at the same slot — different identifier replaces the tip.
 	replacement := makeTestPreConfirmedBlock("rZ", 0)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
-	ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r3", uint64(0)).
-		Return(replacement, uint64(3), nil)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+	gomock.InOrder(
+		// Tick 1: seed blocks 1..3 (latest at 3, backfill walks 1 and 2).
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(seed3, uint64(3), nil),
+		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "", uint64(0)).
+			Return(seed1, nil),
+		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(2), "", uint64(0)).
+			Return(seed2, nil),
+		// Tick 2: same height as the tip, different identifier.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r3", uint64(0)).
+			Return(replacement, uint64(3), nil),
+	)
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, fx.bc, fx.head, ds)
-		_, err := h.storage.ApplyUpdate(seed1, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-		_, err = h.storage.ApplyUpdate(seed2, h.head.Number+2, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-		_, err = h.storage.ApplyUpdate(seed3, h.head.Number+3, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
-		before := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
-		require.Equal(t, 3, before.Length())
-
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
+		// Tick 1.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		view := h.readChain(t)
+		assertChain(t, &view, entry(1, &seed1), entry(2, &seed2), entry(3, &seed3))
+
+		// Tick 2.
 		time.Sleep(tickInterval)
 		synctest.Wait()
 
 		// Deepest slot replaced; lower entries and length untouched.
-		view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+		view = h.readChain(t)
 		assertChain(t, &view,
 			entry(1, &seed1),
 			entry(2, &seed2),
@@ -767,7 +969,7 @@ func TestPollerReorgSameHeightDifferentIdentifier(t *testing.T) {
 	})
 }
 
-// classesAt returns the NewClasses registered on the snapshot's slot at blockNumber.
+// classesAt returns the NewClasses registered on the view's slot at blockNumber.
 func classesAt(
 	snap *preconfirmed.ChainReader,
 	blockNumber uint64,
@@ -801,24 +1003,32 @@ func TestPollerBackfillFetchesDeclaredClasses(t *testing.T) {
 		newTip := makeTestPreConfirmedBlock("r2", 0)
 
 		ctrl := gomock.NewController(t)
-		ds := mocks.NewMockStarknetData(ctrl)
-		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r1", uint64(0)).
-			Return(newTip, uint64(2), nil)
-		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "r1", uint64(0)).
-			Return(repoll, nil)
+		ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+		gomock.InOrder(
+			// Tick 1: seed the old tip.
+			ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+				Return(seed, uint64(1), nil),
+			// Tick 2: forward jump; the old tip is re-polled as a new round.
+			ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r1", uint64(0)).
+				Return(newTip, uint64(2), nil),
+			ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "r1", uint64(0)).
+				Return(repoll, nil),
+		)
 		ds.EXPECT().Class(gomock.Any(), classHash).Return(classDef, nil)
 
 		synctest.Test(t, func(t *testing.T) {
 			h := wirePoller(t, fx.bc, fx.head, ds)
-			_, err := h.storage.ApplyUpdate(seed, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-			require.NoError(t, err)
-
 			go h.poller.Run(t.Context())
 			synctest.Wait()
+
+			// Tick 1.
+			time.Sleep(tickInterval)
+			synctest.Wait()
+			// Tick 2.
 			time.Sleep(tickInterval)
 			synctest.Wait()
 
-			view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+			view := h.readChain(t)
 			require.Equal(t, classDef, classesAt(&view, 1)[*classHash],
 				"the re-polled full block's declared class must be fetched and land on slot 1")
 		})
@@ -848,25 +1058,34 @@ func TestPollerBackfillFetchesDeclaredClasses(t *testing.T) {
 		newTip := makeTestPreConfirmedBlock("r2", 0)
 
 		ctrl := gomock.NewController(t)
-		ds := mocks.NewMockStarknetData(ctrl)
-		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r1", uint64(1)).
-			Return(newTip, uint64(2), nil)
-		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "r1", uint64(1)).
-			Return(repoll, nil)
+		ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+		gomock.InOrder(
+			// Tick 1: seed the old tip. The tick's apply of the latest does not
+			// fetch classes, so storedClass is only resolved by the re-poll below.
+			ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+				Return(seed, uint64(1), nil),
+			// Tick 2: forward jump; the old tip is re-polled with delta hints.
+			ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r1", uint64(1)).
+				Return(newTip, uint64(2), nil),
+			ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "r1", uint64(1)).
+				Return(repoll, nil),
+		)
 		ds.EXPECT().Class(gomock.Any(), storedClass).Return(storedDef, nil)
 		ds.EXPECT().Class(gomock.Any(), deltaClass).Return(deltaDef, nil)
 
 		synctest.Test(t, func(t *testing.T) {
 			h := wirePoller(t, fx.bc, fx.head, ds)
-			_, err := h.storage.ApplyUpdate(seed, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-			require.NoError(t, err)
-
 			go h.poller.Run(t.Context())
 			synctest.Wait()
+
+			// Tick 1.
+			time.Sleep(tickInterval)
+			synctest.Wait()
+			// Tick 2.
 			time.Sleep(tickInterval)
 			synctest.Wait()
 
-			view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+			view := h.readChain(t)
 			classes := classesAt(&view, 1)
 			require.Equal(t, storedDef, classes[*storedClass],
 				"the stored tip's declared class must be recovered and fetched")
@@ -892,24 +1111,32 @@ func TestPollerBackfillFetchesDeclaredClasses(t *testing.T) {
 		newTip := makeTestPreConfirmedBlock("r2", 0)
 
 		ctrl := gomock.NewController(t)
-		ds := mocks.NewMockStarknetData(ctrl)
-		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r1", uint64(1)).
-			Return(newTip, uint64(2), nil)
-		ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "r1", uint64(1)).
-			Return(starknet.PreConfirmedNoChange{}, nil)
+		ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+		gomock.InOrder(
+			// Tick 1: seed the old tip.
+			ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+				Return(seed, uint64(1), nil),
+			// Tick 2: forward jump; the old tip re-poll reports no change.
+			ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r1", uint64(1)).
+				Return(newTip, uint64(2), nil),
+			ds.EXPECT().PreConfirmedBlockByNumber(gomock.Any(), uint64(1), "r1", uint64(1)).
+				Return(starknet.PreConfirmedNoChange{}, nil),
+		)
 		ds.EXPECT().Class(gomock.Any(), storedClass).Return(storedDef, nil)
 
 		synctest.Test(t, func(t *testing.T) {
 			h := wirePoller(t, fx.bc, fx.head, ds)
-			_, err := h.storage.ApplyUpdate(seed, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-			require.NoError(t, err)
-
 			go h.poller.Run(t.Context())
 			synctest.Wait()
+
+			// Tick 1.
+			time.Sleep(tickInterval)
+			synctest.Wait()
+			// Tick 2.
 			time.Sleep(tickInterval)
 			synctest.Wait()
 
-			view := h.storage.SnapshotForBlock(oldestPreConfFor(h.head.Number))
+			view := h.readChain(t)
 			require.Equal(t, storedDef, classesAt(&view, 1)[*storedClass],
 				"the stored tip's declared class must be recovered despite a NoChange re-poll")
 		})
@@ -924,12 +1151,15 @@ func TestPollerBroadcastsOnApply(t *testing.T) {
 	block1 := makeTestPreConfirmedBlock("r0", 1)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
 	ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
 		Return(block1, uint64(1), nil)
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, fx.bc, fx.head, ds)
+		sub := h.poller.Subscribe()
+		t.Cleanup(sub.Unsubscribe)
+
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
@@ -937,17 +1167,17 @@ func TestPollerBroadcastsOnApply(t *testing.T) {
 		synctest.Wait()
 
 		select {
-		case pc := <-h.sub.Recv():
+		case pc := <-sub.Recv():
 			require.NotNil(t, pc)
-			require.Equal(t, uint64(1), pc.Block.Number)
-			require.Equal(t, "r0", pc.BlockIdentifier)
+			require.Equal(t, uint64(1), pc.Value.Block.Number)
+			require.Equal(t, "r0", pc.Value.BlockIdentifier)
 		default:
 			t.Fatal("expected a pre_confirmed broadcast on successful apply")
 		}
 	})
 }
 
-// NoChange must not publish anything
+// NoChange must not publish anything.
 func TestPollerSilentOnNoChange(t *testing.T) {
 	t.Parallel()
 	fx := newChainFixture(t)
@@ -955,25 +1185,41 @@ func TestPollerSilentOnNoChange(t *testing.T) {
 	seed := makeTestPreConfirmedBlock("r0", 0)
 
 	ctrl := gomock.NewController(t)
-	ds := mocks.NewMockStarknetData(ctrl)
-	ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r0", uint64(0)).
-		Return(starknet.PreConfirmedNoChange{}, uint64(1), nil)
+	ds := mocks.NewMockPreConfirmedDataSource(ctrl)
+	gomock.InOrder(
+		// Tick 1: seed the chain through the wire.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "", uint64(0)).
+			Return(seed, uint64(1), nil),
+		// Tick 2: nothing changed.
+		ds.EXPECT().PreConfirmedBlockLatest(gomock.Any(), "r0", uint64(0)).
+			Return(starknet.PreConfirmedNoChange{}, uint64(1), nil),
+	)
 
 	synctest.Test(t, func(t *testing.T) {
 		h := wirePoller(t, fx.bc, fx.head, ds)
-		// Seed directly through storage; this does NOT publish (only the
-		// poller's apply wrapper does Send), so the feed starts clean.
-		_, err := h.storage.ApplyUpdate(seed, h.head.Number+1, 0, oldestPreConfFor(h.head.Number), nil)
-		require.NoError(t, err)
+		sub := h.poller.Subscribe()
+		t.Cleanup(sub.Unsubscribe)
 
 		go h.poller.Run(t.Context())
 		synctest.Wait()
 
+		// Tick 1 seeds through the wire, which publishes once; drain it so the
+		// subscription starts tick 2 clean.
 		time.Sleep(tickInterval)
 		synctest.Wait()
-
 		select {
-		case pc := <-h.sub.Recv():
+		case pc := <-sub.Recv():
+			require.Equal(t, uint64(1), pc.Value.Block.Number)
+			require.Equal(t, "r0", pc.Value.BlockIdentifier)
+		default:
+			t.Fatal("expected the seeding tick to broadcast")
+		}
+
+		// Tick 2: NoChange.
+		time.Sleep(tickInterval)
+		synctest.Wait()
+		select {
+		case pc := <-sub.Recv():
 			t.Fatalf("did not expect a broadcast on NoChange, got %+v", pc)
 		default:
 		}

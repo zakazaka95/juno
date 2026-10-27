@@ -13,11 +13,13 @@ import (
 	"time"
 
 	"github.com/Masterminds/semver/v3"
+	"github.com/NethermindEth/juno/adapters/adaptfeeder"
 	"github.com/NethermindEth/juno/blockchain"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/builder"
 	"github.com/NethermindEth/juno/clients/feeder"
 	"github.com/NethermindEth/juno/clients/gateway"
+	"github.com/NethermindEth/juno/clients/timeout"
 	"github.com/NethermindEth/juno/core"
 	"github.com/NethermindEth/juno/core/felt"
 	"github.com/NethermindEth/juno/db"
@@ -39,12 +41,13 @@ import (
 	"github.com/NethermindEth/juno/sequencer"
 	"github.com/NethermindEth/juno/service"
 	"github.com/NethermindEth/juno/starknet/compiler"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/NethermindEth/juno/sync"
+	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/NethermindEth/juno/vm"
 	"github.com/consensys/gnark-crypto/ecc/stark-curve/ecdsa"
 	"github.com/sourcegraph/conc"
+	"github.com/sourcegraph/conc/pool"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -84,6 +87,8 @@ type Config struct {
 	PprofPort                uint16           `mapstructure:"pprof-port"`
 	Colour                   bool             `mapstructure:"colour"`
 	PreConfirmedPollInterval time.Duration    `mapstructure:"preconfirmed-poll-interval"`
+	PreConfirmedStaleAfter   time.Duration    `mapstructure:"preconfirmed-stale-after"`
+	PreConfirmedOnDemandWait time.Duration    `mapstructure:"preconfirmed-on-demand-wait"`
 	RemoteDB                 string           `mapstructure:"remote-db"`
 	VersionedConstantsFile   string           `mapstructure:"versioned-constants-file"`
 
@@ -218,6 +223,11 @@ func New(cfg *Config, version string, logLevel *log.Level) (*Node, error) {
 	if cfg.Prune && cfg.DisableL1Verification {
 		return nil, errors.New("--prune-mode requires L1 verification; " +
 			"remove --disable-l1-verification or disable --prune-mode")
+	}
+
+	if cfg.Prune && cfg.NewState {
+		return nil, errors.New("--prune-mode and --new-state are mutually exclusive; " +
+			"remove one of them")
 	}
 
 	dbIsRemote := cfg.RemoteDB != ""
@@ -398,9 +408,9 @@ func New(cfg *Config, version string, logLevel *log.Level) (*Node, error) {
 		}
 	} else {
 		if cfg.GatewayTimeouts == "" {
-			cfg.GatewayTimeouts = feeder.DefaultTimeouts
+			cfg.GatewayTimeouts = timeout.DefaultTimeouts
 		}
-		timeouts, fixed, err := feeder.ParseTimeouts(cfg.GatewayTimeouts)
+		timeouts, fixed, err := timeout.ParseTimeouts(cfg.GatewayTimeouts)
 		if err != nil {
 			return nil, fmt.Errorf("invalid gateway timeouts: %w", err)
 		}
@@ -442,14 +452,25 @@ func New(cfg *Config, version string, logLevel *log.Level) (*Node, error) {
 		throttledVM = NewThrottledVM(nodeVM, cfg.MaxVMs, uint64(cfg.MaxVMQueue))
 
 		if !cfg.DisableSync {
-			feederGatewayDataSource := sync.NewFeederGatewayDataSource(chain, adaptfeeder.New(client))
+			preConfirmedOpts := []preconfirmed.Option{
+				preconfirmed.WithPollInterval(cfg.PreConfirmedPollInterval),
+				preconfirmed.WithStaleAfter(cfg.PreConfirmedStaleAfter),
+				preconfirmed.WithOnDemandWait(cfg.PreConfirmedOnDemandWait),
+			}
+			if cfg.Metrics {
+				preConfirmedOpts = append(
+					preConfirmedOpts, preconfirmed.WithListener(makePreConfirmedMetrics()),
+				)
+			}
+
+			gw := adaptfeeder.New(client)
 			synchronizer = sync.New(
 				chain,
-				feederGatewayDataSource,
+				sync.NewFeederGatewayDataSource(chain, gw),
+				gw,
 				logger,
-				cfg.PreConfirmedPollInterval,
-				dbIsRemote,
-				database,
+				sync.WithPreConfirmed(preConfirmedOpts...),
+				sync.WithReadOnlyBlockchain(dbIsRemote),
 			)
 			synchronizer.WithPlugin(junoPlugin)
 		}
@@ -541,7 +562,9 @@ func New(cfg *Config, version string, logLevel *log.Level) (*Node, error) {
 	}
 	maxBatchResponseBytes := int(cfg.RPCMaxBatchResponseSize) * db.Megabyte
 
-	jsonrpcServerV10 := jsonrpc.NewServer(maxGoroutines, logger).
+	batchPool := pool.New().WithMaxGoroutines(maxGoroutines)
+
+	jsonrpcServerV10 := jsonrpc.NewServer(batchPool, logger).
 		WithValidator(rpcv10.Validator()).
 		WithMaxBatchElements(int(cfg.RPCMaxBatchSize)).
 		WithMaxBatchResponseBytes(maxBatchResponseBytes).
@@ -551,7 +574,7 @@ func New(cfg *Config, version string, logLevel *log.Level) (*Node, error) {
 		return nil, err
 	}
 
-	jsonrpcServerV09 := jsonrpc.NewServer(maxGoroutines, logger).
+	jsonrpcServerV09 := jsonrpc.NewServer(batchPool, logger).
 		WithValidator(rpcv9.Validator()).
 		WithMaxBatchElements(int(cfg.RPCMaxBatchSize)).
 		WithMaxBatchResponseBytes(maxBatchResponseBytes).
@@ -561,7 +584,7 @@ func New(cfg *Config, version string, logLevel *log.Level) (*Node, error) {
 		return nil, err
 	}
 
-	jsonrpcServerV08 := jsonrpc.NewServer(maxGoroutines, logger).
+	jsonrpcServerV08 := jsonrpc.NewServer(batchPool, logger).
 		WithValidator(rpcv8.Validator()).
 		WithMaxBatchElements(int(cfg.RPCMaxBatchSize)).
 		WithMaxBatchResponseBytes(maxBatchResponseBytes).
@@ -590,6 +613,13 @@ func New(cfg *Config, version string, logLevel *log.Level) (*Node, error) {
 		"/rpc" + pathV09: jsonrpcServerV09,
 		"/rpc" + pathV08: jsonrpcServerV08,
 	}
+	var rpcGate *jsonrpc.Gate
+	if (cfg.HTTP || cfg.Websocket) && cfg.RPCMaxConcurrentRequests > 0 {
+		rpcGate = jsonrpc.NewGate(cfg.RPCMaxConcurrentRequests, uint64(cfg.RPCMaxRequestQueue))
+		if cfg.Metrics {
+			makeRPCGateMetrics(rpcGate)
+		}
+	}
 	if cfg.HTTP {
 		readinessHandlers := NewReadinessHandlers(chain, syncReader, cfg.ReadinessBlockTolerance)
 		httpHandlers := map[string]http.HandlerFunc{
@@ -609,8 +639,7 @@ func New(cfg *Config, version string, logLevel *log.Level) (*Node, error) {
 				cfg.Metrics,
 				cfg.RPCCorsEnable,
 				cfg.RPCRequestTimeout,
-				cfg.RPCMaxConcurrentRequests,
-				cfg.RPCMaxRequestQueue,
+				rpcGate,
 			),
 		)
 	}
@@ -625,16 +654,26 @@ func New(cfg *Config, version string, logLevel *log.Level) (*Node, error) {
 				cfg.Metrics,
 				cfg.RPCCorsEnable,
 				cfg.RPCRequestTimeout,
+				rpcGate,
 			),
 		)
 	}
 	if cfg.HTTPUpdatePort != 0 {
-		logger.Info(
-			"Log level and feeder gateway timeouts can be changed via HTTP PUT request to " +
-				cfg.HTTPUpdateHost + ":" + fmt.Sprintf("%d", cfg.HTTPUpdatePort) +
-				"/log/level and /feeder/timeouts",
+		timeoutClients := make([]timeout.Client, 0, 1)
+		if client != nil {
+			timeoutClients = append(timeoutClients, client)
+		}
+		httpUpdateAddr := cfg.HTTPUpdateHost + ":" + fmt.Sprintf("%d", cfg.HTTPUpdatePort)
+		if len(timeoutClients) > 0 {
+			logger.Info("Log level and feeder gateway timeouts can be changed via HTTP PUT request to " +
+				httpUpdateAddr + "/log/level and /feeder/timeouts")
+		} else {
+			logger.Info("Log level can be changed via HTTP PUT request to " + httpUpdateAddr + "/log/level")
+		}
+		earlyServices = append(
+			earlyServices,
+			makeHTTPUpdateService(cfg.HTTPUpdateHost, cfg.HTTPUpdatePort, logLevel, timeoutClients...),
 		)
-		earlyServices = append(earlyServices, makeHTTPUpdateService(cfg.HTTPUpdateHost, cfg.HTTPUpdatePort, logLevel, client))
 	}
 	if cfg.Metrics {
 		makeJeMallocMetrics()

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder"
 	"github.com/NethermindEth/juno/blockchain"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
@@ -12,8 +13,8 @@ import (
 	"github.com/NethermindEth/juno/db/pebblev2"
 	"github.com/NethermindEth/juno/node"
 	"github.com/NethermindEth/juno/starknet/compiler"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/NethermindEth/juno/sync"
+	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/stretchr/testify/require"
 )
@@ -158,14 +159,22 @@ func TestNetworkVerificationOnNonEmptyDB(t *testing.T) {
 				blockchain.WithNewState(statetestutils.UseNewState()),
 			)
 			ctx, cancel := context.WithCancel(t.Context())
-			dataSource := sync.NewFeederGatewayDataSource(chain, adaptfeeder.New(feeder.NewTestClient(t, &network)))
-			syncer := sync.New(chain, dataSource, logger, 0, false, database).
-				WithListener(&sync.SelectiveListener{OnSyncStepDoneCb: func(op string, _ uint64, _ time.Duration) {
+			feederClient := adaptfeeder.New(feeder.NewTestClient(t, &network))
+			dataSource := sync.NewFeederGatewayDataSource(chain, feederClient)
+			syncer := sync.New(
+				chain,
+				dataSource,
+				feederClient,
+				logger,
+				sync.WithPreConfirmed(preconfirmed.WithPollInterval(0)),
+			).WithListener(&sync.SelectiveListener{
+				OnSyncStepDoneCb: func(op string, _ uint64, _ time.Duration) {
 					// Stop the syncer after we successfully stored block.
 					if op == sync.OpStore {
 						cancel()
 					}
-				}})
+				},
+			})
 			require.NoError(t, syncer.Run(ctx))
 			cancel()
 			require.NoError(t, database.Close())
@@ -194,6 +203,14 @@ func TestNew_RejectsPruneWithoutL1Verification(t *testing.T) {
 		DisableL1Verification: true,
 	}, "test", log.NewLevel(log.INFO))
 	require.ErrorContains(t, err, "prune-mode requires L1 verification")
+}
+
+func TestNew_RejectsPruneWithNewState(t *testing.T) {
+	_, err := node.New(&node.Config{
+		Prune:    true,
+		NewState: true,
+	}, "test", log.NewLevel(log.INFO))
+	require.ErrorContains(t, err, "--prune-mode and --new-state are mutually exclusive")
 }
 
 func TestNewRejectsModesThatRequireSynchronization(t *testing.T) {

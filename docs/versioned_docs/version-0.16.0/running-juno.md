@@ -1,8 +1,9 @@
 ---
 title: Installation
+description: "Start a Juno node with Docker, a prebuilt binary, or a source build, on mainnet or Sepolia."
 ---
 
-# Running Juno :rocket:
+# Running Juno
 
 ```mdx-code-block
 import Tabs from "@theme/Tabs";
@@ -11,7 +12,7 @@ import TabItem from "@theme/TabItem";
 
 You can run a Juno node using several methods:
 
-- **Docker container** or **Standalone binary** — see below
+- **Docker container** or **Standalone binary** (see below)
 - [Building from source](#building-from-source)
 - [Kubernetes with Helm](running-on-kubernetes)
 - [Google Cloud Platform (GCP)](running-on-gcp)
@@ -174,7 +175,7 @@ docker run -d \
 
 **Prerequisites**
 
-- [Golang 1.26](https://go.dev/doc/install) or later
+- [Golang 1.27](https://go.dev/doc/install) or later
 - [Rust](https://www.rust-lang.org/tools/install) 1.94.1 or higher.
 - C compiler: `gcc` or `clang`
 - [jemalloc](https://github.com/jemalloc/jemalloc)

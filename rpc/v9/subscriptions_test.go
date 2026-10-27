@@ -8,9 +8,11 @@ import (
 	"io"
 	"net"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/NethermindEth/juno/adapters/adaptfeeder/adaptfeedertest"
 	"github.com/NethermindEth/juno/blockchain"
 	"github.com/NethermindEth/juno/blockchain/networks"
 	"github.com/NethermindEth/juno/clients/feeder"
@@ -24,11 +26,11 @@ import (
 	"github.com/NethermindEth/juno/jsonrpc"
 	"github.com/NethermindEth/juno/mocks"
 	"github.com/NethermindEth/juno/rpc/rpccore"
-	adaptfeeder "github.com/NethermindEth/juno/starknetdata/feeder"
 	"github.com/NethermindEth/juno/sync"
 	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/coder/websocket"
+	"github.com/sourcegraph/conc/pool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -67,16 +69,16 @@ func (fc *fakeConn) Context() context.Context {
 }
 
 type fakeSyncer struct {
-	newHeads     *feed.Feed[*core.Block]
+	newHeads     *feed.Feed[*core.WithBloom[*core.Block]]
 	reorgs       *feed.Feed[*sync.ReorgBlockRange]
-	preConfirmed *feed.Feed[*pending.PreConfirmed]
+	preConfirmed *feed.Feed[*core.WithBloom[*pending.PreConfirmed]]
 }
 
 func newFakeSyncer() *fakeSyncer {
 	return &fakeSyncer{
-		newHeads:     feed.New[*core.Block](),
+		newHeads:     feed.New[*core.WithBloom[*core.Block]](),
 		reorgs:       feed.New[*sync.ReorgBlockRange](),
-		preConfirmed: feed.New[*pending.PreConfirmed](),
+		preConfirmed: feed.New[*core.WithBloom[*pending.PreConfirmed]](),
 	}
 }
 
@@ -88,8 +90,8 @@ func (fs *fakeSyncer) SubscribeReorg() sync.ReorgSubscription {
 	return sync.ReorgSubscription{Subscription: fs.reorgs.Subscribe()}
 }
 
-func (fs *fakeSyncer) SubscribePreConfirmed() sync.PreConfirmedDataSubscription {
-	return sync.PreConfirmedDataSubscription{Subscription: fs.preConfirmed.Subscribe()}
+func (fs *fakeSyncer) SubscribePreConfirmed() preconfirmed.Subscription {
+	return preconfirmed.Subscription{Subscription: fs.preConfirmed.Subscribe()}
 }
 
 func (fs *fakeSyncer) StartingBlockHeader() (*core.Header, error) {
@@ -100,7 +102,11 @@ func (fs *fakeSyncer) HighestBlockHeader() *core.Header {
 	return nil
 }
 
-func (fs *fakeSyncer) PreConfirmedChain() (preconfirmed.ChainReader, error) {
+func (fs *fakeSyncer) RequestPreConfirmedChain() (preconfirmed.ChainReader, error) {
+	return preconfirmed.ChainReader{}, db.ErrKeyNotFound
+}
+
+func (fs *fakeSyncer) ReadPreConfirmedChain() (preconfirmed.ChainReader, error) {
 	return preconfirmed.ChainReader{}, db.ErrKeyNotFound
 }
 
@@ -220,16 +226,11 @@ func TestSubscribeEvents(t *testing.T) {
 
 	n := &networks.Sepolia
 	client := feeder.NewTestClient(t, n)
-	gw := adaptfeeder.New(client)
 
-	b1, err := gw.BlockByNumber(t.Context(), 56377)
-	require.NoError(t, err)
-
-	b2, err := gw.BlockByNumber(t.Context(), 56378)
-	require.NoError(t, err)
-
-	b3, err := gw.BlockByNumber(t.Context(), 56379)
-	require.NoError(t, err)
+	b1 := adaptfeedertest.Block(t, client, 56377)
+	b2 := adaptfeedertest.Block(t, client, 56378)
+	b2WithBloom := newBlockWithBloom(b2)
+	b3 := adaptfeedertest.Block(t, client, 56379)
 
 	b1Filtered, b1Emitted := createTestEvents(
 		t,
@@ -255,7 +256,9 @@ func TestSubscribeEvents(t *testing.T) {
 	)
 
 	b2PreConfirmedPartial := createTestPreConfirmed(t, b2, 3)
+	b2PreConfirmedPartialWithBloom := newPreConfirmedWithBloom(&b2PreConfirmedPartial)
 	b2PreConfirmedExtended := createTestPreConfirmed(t, b2, 6)
+	b2PreConfirmedExtendedWithBloom := newPreConfirmedWithBloom(&b2PreConfirmedExtended)
 
 	_, b2PreConfirmedPartialEmitted := createTestEvents(
 		t,
@@ -273,7 +276,9 @@ func TestSubscribeEvents(t *testing.T) {
 	)
 
 	b3PreConfirmedPartial := createTestPreConfirmed(t, b3, len(b3.Transactions)-1)
+	b3PreConfirmedPartialWithBloom := newPreConfirmedWithBloom(&b3PreConfirmedPartial)
 	b3PreConfirmedFull := createTestPreConfirmed(t, b3, len(b3.Transactions))
+	b3PreConfirmedFullWithBloom := newPreConfirmedWithBloom(&b3PreConfirmedFull)
 	_, b3PreConfirmedPartialEmitted := createTestEvents(
 		t,
 		b3PreConfirmedPartial.Block,
@@ -392,21 +397,21 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "on pre_confirmed block",
 				notify: func() {
-					handler.preConfirmedFeed.Send(&b2PreConfirmedPartial)
+					handler.preConfirmedFeed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{},
 			},
 			{
 				description: "on pre_confirmed block update, without duplicates",
 				notify: func() {
-					handler.preConfirmedFeed.Send(&b2PreConfirmedExtended)
+					handler.preConfirmedFeed.Send(b2PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{},
 			},
 			{
 				description: "on new head",
 				notify: func() {
-					handler.newHeads.Send(b2)
+					handler.newHeads.Send(b2WithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{b2Emitted},
 			},
@@ -438,7 +443,7 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "pre_confirmed tip delivered via feed after handoff",
 				notify: func() {
-					handler.preConfirmedFeed.Send(&b2PreConfirmedPartial)
+					handler.preConfirmedFeed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{
 					b2PreConfirmedPartialEmitted,
@@ -447,7 +452,7 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "on pre_confirmed block update, without duplicates",
 				notify: func() {
-					handler.preConfirmedFeed.Send(&b2PreConfirmedExtended)
+					handler.preConfirmedFeed.Send(b2PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{
 					b2PreConfirmedExtendedEmitted[len(b2PreConfirmedPartialEmitted):],
@@ -456,7 +461,7 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "on new head",
 				notify: func() {
-					handler.newHeads.Send(b2)
+					handler.newHeads.Send(b2WithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{b2Emitted},
 			},
@@ -567,7 +572,7 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "on pre_confirmed block update, without duplicates",
 				notify: func() {
-					handler.preConfirmedFeed.Send(&b2PreConfirmedExtended)
+					handler.preConfirmedFeed.Send(b2PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{
 					b2PreConfirmedExtendedEmittedByAddr[len(b2PreConfirmedPartialEmittedByAddr):],
@@ -576,7 +581,7 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "on new head",
 				notify: func() {
-					handler.newHeads.Send(b2)
+					handler.newHeads.Send(b2WithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{b2EmittedByAddr},
 			},
@@ -609,7 +614,7 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "on pre_confirmed block update, without duplicates",
 				notify: func() {
-					handler.preConfirmedFeed.Send(&b2PreConfirmedExtended)
+					handler.preConfirmedFeed.Send(b2PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{
 					b2PreConfirmedExtendedEmittedByAddrAndKey[len(b2PreConfirmedPartialEmittedByAddrAndKey):],
@@ -618,7 +623,7 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "on new head",
 				notify: func() {
-					handler.newHeads.Send(b2)
+					handler.newHeads.Send(b2WithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{b2EmittedByAddrAndKey},
 			},
@@ -647,7 +652,7 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "pre_confirmed tip delivered via feed after handoff",
 				notify: func() {
-					handler.preConfirmedFeed.Send(&b2PreConfirmedPartial)
+					handler.preConfirmedFeed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{
 					b2PreConfirmedPartialEmitted,
@@ -656,7 +661,7 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "on pre_confirmed block update, without duplicates",
 				notify: func() {
-					handler.preConfirmedFeed.Send(&b2PreConfirmedExtended)
+					handler.preConfirmedFeed.Send(b2PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{
 					b2PreConfirmedExtendedEmitted[len(b2PreConfirmedPartialEmitted):],
@@ -665,14 +670,14 @@ func TestSubscribeEvents(t *testing.T) {
 			{
 				description: "new pre_confirmed block",
 				notify: func() {
-					handler.preConfirmedFeed.Send(&b3PreConfirmedPartial)
+					handler.preConfirmedFeed.Send(b3PreConfirmedPartialWithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{b3PreConfirmedPartialEmitted},
 			},
 			{
 				description: "pre_confirmed update - without duplicates",
 				notify: func() {
-					handler.preConfirmedFeed.Send(&b3PreConfirmedFull)
+					handler.preConfirmedFeed.Send(b3PreConfirmedFullWithBloom)
 				},
 				expect: [][]SubscriptionEmittedEvent{
 					b3PreConfirmedFullEmitted[len(b3PreConfirmedPartialEmitted):],
@@ -727,6 +732,76 @@ func TestSubscribeEvents(t *testing.T) {
 	}
 }
 
+// A reorg that shortens the chain while the replay runs leaves the replay's end above the
+// canonical head. The filter then reaches for the pre-confirmed chain to find that head, and the
+// stored chain is enough for it: the replay sends the canonical events without requesting a
+// fresh chain.
+func TestSubscribeEventsReplayReadsStoredPreConfirmedChain(t *testing.T) {
+	network := &networks.Sepolia
+	chain := blockchain.New(
+		memory.New(),
+		network,
+		blockchain.WithNewState(statetestutils.UseNewState()),
+	)
+	client := feeder.NewTestClient(t, network)
+
+	const reorgedHeight = uint64(4)
+	var replayedEvents []SubscriptionEmittedEvent
+	for number := range reorgedHeight + 1 {
+		block := adaptfeedertest.Block(t, client, number)
+		stateUpdate := adaptfeedertest.StateUpdate(t, client, number)
+		require.NoError(t, chain.Store(
+			block, &core.BlockCommitments{}, stateUpdate, nil, core.EventsBloom(block.Receipts),
+		))
+		if number >= reorgedHeight-1 {
+			_, emitted := createTestEvents(t, block, nil, nil, TxnAcceptedOnL2)
+			replayedEvents = append(replayedEvents, emitted...)
+		}
+	}
+	require.NotEmpty(t, replayedEvents)
+
+	emptyStateDiff := core.EmptyStateDiff()
+	placeholder := pending.PreConfirmed{
+		Block: &core.Block{
+			Header:       &core.Header{Number: reorgedHeight + 1},
+			Transactions: []core.Transaction{},
+			Receipts:     []*core.TransactionReceipt{},
+		},
+		StateUpdate:     &core.StateUpdate{StateDiff: &emptyStateDiff},
+		BlockIdentifier: feeder.PreConfirmedBlankIdentifier,
+	}
+
+	mockCtrl := gomock.NewController(t)
+	mockChain := mocks.NewMockReader(mockCtrl)
+	// The subscription was made at the height before the reorg; the filter runs on the
+	// shortened chain.
+	mockChain.EXPECT().Height().Return(reorgedHeight+1, nil)
+	mockChain.EXPECT().L1Head().Return(core.L1Head{}, nil)
+	mockChain.EXPECT().EventFilter(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(chain.EventFilter)
+	// The calls are counted rather than left unexpected: the replay runs off the test goroutine,
+	// where an unexpected call would leave the test waiting for events instead of failing it.
+	var reads, requests atomic.Int32
+	mockSyncer := mocks.NewMockSyncReader(mockCtrl)
+	mockSyncer.EXPECT().ReadPreConfirmedChain().
+		DoAndReturn(func() (preconfirmed.ChainReader, error) {
+			reads.Add(1)
+			return mustNewChain(t, &placeholder), nil
+		}).AnyTimes()
+	mockSyncer.EXPECT().RequestPreConfirmedChain().
+		DoAndReturn(func() (preconfirmed.ChainReader, error) {
+			requests.Add(1)
+			return mustNewChain(t, &placeholder), nil
+		}).AnyTimes()
+	handler := New(mockChain, mockSyncer, nil, log.NewNopZapLogger())
+
+	blockID := SubscriptionBlockID(BlockIDFromNumber(reorgedHeight - 1))
+	subscriptionID, conn := createTestEventsWebsocket(t, handler, nil, nil, &blockID, nil)
+	assertNextEvents(t, conn, subscriptionID, replayedEvents)
+	require.Positive(t, reads.Load(), "the replay never reached for the pre-confirmed chain")
+	require.Zero(t, requests.Load())
+}
+
 func TestSubscribeTxnStatus(t *testing.T) {
 	logger := log.NewNopZapLogger()
 	txHash := felt.NewFromUint64[felt.Felt](1)
@@ -753,7 +828,11 @@ func TestSubscribeTxnStatus(t *testing.T) {
 			(*felt.TransactionHash)(txHash),
 		).Return(uint64(0), uint64(0), db.ErrKeyNotFound).AnyTimes()
 		mockSyncer.EXPECT().
-			PreConfirmedChain().
+			ReadPreConfirmedChain().
+			Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound).
+			AnyTimes()
+		mockSyncer.EXPECT().
+			RequestPreConfirmedChain().
 			Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound).
 			AnyTimes()
 		mockChain.EXPECT().HeadsHeader().Return(nil, db.ErrKeyNotFound).AnyTimes()
@@ -776,7 +855,11 @@ func TestSubscribeTxnStatus(t *testing.T) {
 		handler := New(mockChain, mockSyncer, nil, logger)
 		handler.WithFeeder(feeder.NewTestClient(t, &networks.SepoliaIntegration))
 		mockSyncer.EXPECT().
-			PreConfirmedChain().
+			ReadPreConfirmedChain().
+			Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound).
+			AnyTimes()
+		mockSyncer.EXPECT().
+			RequestPreConfirmedChain().
 			Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound).
 			AnyTimes()
 		mockChain.EXPECT().HeadsHeader().Return(nil, db.ErrKeyNotFound).AnyTimes()
@@ -786,7 +869,7 @@ func TestSubscribeTxnStatus(t *testing.T) {
 
 			mockChain.EXPECT().BlockNumberAndIndexByTxHash(
 				(*felt.TransactionHash)(txHash),
-			).Return(uint64(0), uint64(0), db.ErrKeyNotFound)
+			).Return(uint64(0), uint64(0), db.ErrKeyNotFound).Times(2)
 			id, conn := createTestTxStatusWebsocket(t, handler, txHash)
 			assertNextTxnStatus(t, conn, id, txHash, TxnStatusAcceptedOnL2, TxnFailure, "some error")
 		})
@@ -796,7 +879,7 @@ func TestSubscribeTxnStatus(t *testing.T) {
 
 			mockChain.EXPECT().BlockNumberAndIndexByTxHash(
 				(*felt.TransactionHash)(txHash),
-			).Return(uint64(0), uint64(0), db.ErrKeyNotFound)
+			).Return(uint64(0), uint64(0), db.ErrKeyNotFound).Times(2)
 			id, conn := createTestTxStatusWebsocket(t, handler, txHash)
 			assertNextTxnStatus(t, conn, id, txHash, TxnStatusAcceptedOnL1, TxnSuccess, "")
 		})
@@ -808,7 +891,6 @@ func TestSubscribeTxnStatus(t *testing.T) {
 
 		client := feeder.NewTestClient(t, &networks.SepoliaIntegration)
 		mockGateway := mocks.NewMockGateway(mockCtrl)
-		adapterFeeder := adaptfeeder.New(client)
 		mockChain := mocks.NewMockReader(mockCtrl)
 		mockSyncer := mocks.NewMockSyncReader(mockCtrl)
 		cache := rpccore.NewTransactionCache(cacheEntryTimeOut, cacheSize)
@@ -817,8 +899,7 @@ func TestSubscribeTxnStatus(t *testing.T) {
 			WithGateway(mockGateway).
 			WithSubmittedTransactionsCache(cache)
 
-		block, err := adapterFeeder.BlockByNumber(t.Context(), 38748)
-		require.NoError(t, err)
+		block := adaptfeedertest.Block(t, client, 38748)
 
 		txToBroadcast := BroadcastedTransaction{Transaction: AdaptTransaction(block.Transactions[0])}
 
@@ -844,8 +925,10 @@ func TestSubscribeTxnStatus(t *testing.T) {
 		txHash := addRes.TransactionHash
 		mockChain.EXPECT().BlockNumberAndIndexByTxHash((*felt.TransactionHash)(txHash)).Return(
 			uint64(0), uint64(0), db.ErrKeyNotFound,
-		)
-		mockSyncer.EXPECT().PreConfirmedChain().
+		).Times(2)
+		mockSyncer.EXPECT().ReadPreConfirmedChain().
+			Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound)
+		mockSyncer.EXPECT().RequestPreConfirmedChain().
 			Return(preconfirmed.ChainReader{}, db.ErrKeyNotFound).Times(1)
 
 		id, conn := createTestTxStatusWebsocket(t, handler, txHash)
@@ -868,24 +951,15 @@ func TestSubscribeTxnStatus(t *testing.T) {
 				Receipts: []*core.TransactionReceipt{block.Receipts[0]},
 			},
 		}
-		mockSyncer.EXPECT().PreConfirmedChain().
-			Return(mustNewChain(t, preConfirmed), nil).Times(1)
-		handler.preConfirmedFeed.Send(preConfirmed)
+		mockSyncer.EXPECT().ReadPreConfirmedChain().Return(mustNewChain(t, preConfirmed), nil)
+		handler.preConfirmedFeed.Send(newPreConfirmedWithBloom(preConfirmed))
 		assertNextTxnStatus(t, conn, id, txHash, TxnStatusPreConfirmed, TxnSuccess, "")
 
-		preConfirmed = &pending.PreConfirmed{
-			Block: &core.Block{
-				Header: &core.Header{
-					Number:           block.Number + 1,
-					TransactionCount: 0,
-				},
-				Transactions: []core.Transaction{},
-				Receipts:     []*core.TransactionReceipt{},
-			},
-		}
-		mockSyncer.EXPECT().PreConfirmedChain().
-			Return(mustNewChain(t, preConfirmed), nil).Times(1)
-		// Accepted on l2 Status
+		// Accepted on l2 Status. The stored chain now starts above the committed block.
+		chainAboveBlock := mustNewChain(t, &pending.PreConfirmed{
+			Block: &core.Block{Header: &core.Header{Number: block.Number + 1}},
+		})
+		mockSyncer.EXPECT().ReadPreConfirmedChain().Return(chainAboveBlock, nil)
 		mockChain.EXPECT().BlockNumberAndIndexByTxHash(
 			(*felt.TransactionHash)(txHash),
 		).Return(block.Number, uint64(0), nil)
@@ -897,12 +971,11 @@ func TestSubscribeTxnStatus(t *testing.T) {
 		}, nil)
 		mockChain.EXPECT().L1Head().Return(core.L1Head{}, db.ErrKeyNotFound)
 
-		handler.newHeads.Send(block)
+		handler.newHeads.Send(newBlockWithBloom(block))
 		assertNextTxnStatus(t, conn, id, txHash, TxnStatusAcceptedOnL2, TxnSuccess, "")
 
-		mockSyncer.EXPECT().PreConfirmedChain().
-			Return(mustNewChain(t, preConfirmed), nil).Times(1)
 		l1Head := core.L1Head{BlockNumber: block.Number}
+		mockSyncer.EXPECT().ReadPreConfirmedChain().Return(chainAboveBlock, nil)
 		mockChain.EXPECT().BlockNumberAndIndexByTxHash(
 			(*felt.TransactionHash)(txHash),
 		).Return(block.Number, uint64(0), nil)
@@ -1022,7 +1095,7 @@ func TestSubscribeNewHeads(t *testing.T) {
 		require.NoError(t, err)
 
 		// Simulate a new block
-		syncer.newHeads.Send(testHeadBlock(t))
+		syncer.newHeads.Send(newBlockWithBloom(testHeadBlock(t)))
 
 		// Receive a block header.
 		_, headerGot, err := conn.Read(ctx)
@@ -1033,13 +1106,9 @@ func TestSubscribeNewHeads(t *testing.T) {
 
 func TestSubscribeNewHeadsHistorical(t *testing.T) {
 	client := feeder.NewTestClient(t, &networks.Mainnet)
-	gw := adaptfeeder.New(client)
 
-	block0, err := gw.BlockByNumber(t.Context(), 0)
-	require.NoError(t, err)
-
-	stateUpdate0, err := gw.StateUpdate(t.Context(), 0)
-	require.NoError(t, err)
+	block0 := adaptfeedertest.Block(t, client, 0)
+	stateUpdate0 := adaptfeedertest.StateUpdate(t, client, 0)
 
 	testDB := memory.New()
 	chain := blockchain.New(
@@ -1047,7 +1116,9 @@ func TestSubscribeNewHeadsHistorical(t *testing.T) {
 		&networks.Mainnet,
 		blockchain.WithNewState(statetestutils.UseNewState()),
 	)
-	assert.NoError(t, chain.Store(block0, &emptyCommitments, stateUpdate0, nil))
+	assert.NoError(t, chain.Store(
+		block0, &emptyCommitments, stateUpdate0, nil, core.EventsBloom(block0.Receipts),
+	))
 
 	chain = blockchain.New(
 		testDB,
@@ -1078,7 +1149,7 @@ func TestSubscribeNewHeadsHistorical(t *testing.T) {
 	require.Equal(t, want, string(block0Got))
 
 	// Simulate a new block
-	syncer.newHeads.Send(testHeadBlock(t))
+	syncer.newHeads.Send(newBlockWithBloom(testHeadBlock(t)))
 
 	// Check new block content
 	_, newBlockGot, err := conn.Read(ctx)
@@ -1088,13 +1159,9 @@ func TestSubscribeNewHeadsHistorical(t *testing.T) {
 
 func TestSubscribeNewHeadsHistoricalByHash(t *testing.T) {
 	client := feeder.NewTestClient(t, &networks.Mainnet)
-	gw := adaptfeeder.New(client)
 
-	block0, err := gw.BlockByNumber(t.Context(), 0)
-	require.NoError(t, err)
-
-	stateUpdate0, err := gw.StateUpdate(t.Context(), 0)
-	require.NoError(t, err)
+	block0 := adaptfeedertest.Block(t, client, 0)
+	stateUpdate0 := adaptfeedertest.StateUpdate(t, client, 0)
 
 	testDB := memory.New()
 	chain := blockchain.New(
@@ -1102,7 +1169,9 @@ func TestSubscribeNewHeadsHistoricalByHash(t *testing.T) {
 		&networks.Mainnet,
 		blockchain.WithNewState(statetestutils.UseNewState()),
 	)
-	assert.NoError(t, chain.Store(block0, &emptyCommitments, stateUpdate0, nil))
+	assert.NoError(t, chain.Store(
+		block0, &emptyCommitments, stateUpdate0, nil, core.EventsBloom(block0.Receipts),
+	))
 
 	chain = blockchain.New(
 		testDB,
@@ -1203,7 +1272,7 @@ func TestMultipleSubscribeNewHeadsAndUnsubscribe(t *testing.T) {
 	require.NoError(t, err)
 
 	// Simulate a new block
-	syncer.newHeads.Send(testHeadBlock(t))
+	syncer.newHeads.Send(newBlockWithBloom(testHeadBlock(t)))
 
 	// Receive a block header.
 	_, firstHeaderGot, err := conn1.Read(ctx)
@@ -1330,13 +1399,12 @@ func TestSubscribeNewTransactions(t *testing.T) {
 
 	n := &networks.Sepolia
 	client := feeder.NewTestClient(t, n)
-	gw := adaptfeeder.New(client)
 
-	newHead1, err := gw.BlockByNumber(t.Context(), 56377)
-	require.NoError(t, err)
+	newHead1 := adaptfeedertest.Block(t, client, 56377)
+	newHead1WithBloom := newBlockWithBloom(newHead1)
 
-	newHead2, err := gw.BlockByNumber(t.Context(), 56378)
-	require.NoError(t, err)
+	newHead2 := adaptfeedertest.Block(t, client, 56378)
+	newHead2WithBloom := newBlockWithBloom(newHead2)
 
 	toTransactionsWithFinalityStatus := func(txs []core.Transaction, finalityStatus TxnStatusWithoutL1) []*SubscriptionNewTransaction {
 		txsWithStatus := make([]*SubscriptionNewTransaction, len(txs))
@@ -1354,13 +1422,19 @@ func TestSubscribeNewTransactions(t *testing.T) {
 
 	// Pre-confirmed blocks for block 56377
 	b1PreConfirmedPartial := createTestPreConfirmed(t, newHead1, partialPreConfirmedCount)
+	b1PreConfirmedPartialWithBloom := newPreConfirmedWithBloom(&b1PreConfirmedPartial)
 	b1PreConfirmedExtended := createTestPreConfirmed(t, newHead1, extendedPreConfirmedCount)
+	b1PreConfirmedExtendedWithBloom := newPreConfirmedWithBloom(&b1PreConfirmedExtended)
 	b1PreConfirmedFull := createTestPreConfirmed(t, newHead1, len(newHead1.Transactions))
+	b1PreConfirmedFullWithBloom := newPreConfirmedWithBloom(&b1PreConfirmedFull)
 
 	// Pre-confirmed blocks for block 56378
 	b2PreConfirmedPartial := createTestPreConfirmed(t, newHead2, partialPreConfirmedCount)
+	b2PreConfirmedPartialWithBloom := newPreConfirmedWithBloom(&b2PreConfirmedPartial)
 	b2PreConfirmedExtended := createTestPreConfirmed(t, newHead2, extendedPreConfirmedCount)
+	b2PreConfirmedExtendedWithBloom := newPreConfirmedWithBloom(&b2PreConfirmedExtended)
 	b2PreConfirmedFull := createTestPreConfirmed(t, newHead2, len(newHead2.Transactions))
+	b2PreConfirmedFullWithBloom := newPreConfirmedWithBloom(&b2PreConfirmedFull)
 
 	type stepInfo struct {
 		description string
@@ -1384,7 +1458,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on new head receive all txs with ACCEPTED_ON_L2",
 				notify: func() {
-					syncer.newHeads.Send(newHead1)
+					syncer.newHeads.Send(newHead1WithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(newHead1.Transactions, TxnStatusWithoutL1(TxnStatusAcceptedOnL2)),
@@ -1393,14 +1467,14 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on new pre_confirmed no stream",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedPartial)
+					syncer.preConfirmed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{},
 			},
 			{
 				description: "pre_confirmed becomes new head, stream ACCEPTED_ON_L2 txs",
 				notify: func() {
-					syncer.newHeads.Send(newHead2)
+					syncer.newHeads.Send(newHead2WithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1420,7 +1494,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on new pre_confirmed",
 				notify: func() {
-					syncer.preConfirmed.Send(&b1PreConfirmedPartial)
+					syncer.preConfirmed.Send(b1PreConfirmedPartialWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1432,7 +1506,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "extended pre_confirmed streams new PRE_CONFIRMED txs without dup.",
 				notify: func() {
-					syncer.preConfirmed.Send(&b1PreConfirmedFull)
+					syncer.preConfirmed.Send(b1PreConfirmedFullWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1444,7 +1518,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on new pre_confirmed",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedPartial)
+					syncer.preConfirmed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1456,7 +1530,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "pre_confirmed becomes head, no stream",
 				notify: func() {
-					syncer.newHeads.Send(newHead1)
+					syncer.newHeads.Send(newHead1WithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{},
 			},
@@ -1487,7 +1561,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on new head receive all txs with ACCEPTED_ON_L2",
 				notify: func() {
-					syncer.newHeads.Send(newHead1)
+					syncer.newHeads.Send(newHead1WithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(newHead1.Transactions, TxnStatusWithoutL1(TxnStatusAcceptedOnL2)),
@@ -1496,7 +1570,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on new pre_confirmed receive PRE_CONFIRMED txs",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedPartial)
+					syncer.preConfirmed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1508,7 +1582,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on pre_confirmed update stream new PRE_CONFIRMED txs, no dup",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedExtended)
+					syncer.preConfirmed.Send(b2PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1520,7 +1594,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on pre_confirmed extended to full, stream remaining PRE_CONFIRMED txs, no dup",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedFull)
+					syncer.preConfirmed.Send(b2PreConfirmedFullWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1532,7 +1606,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "pre_confirmed becomes new head, stream ACCEPTED_ON_L2 txs (no PRE_CONFIRMED dup)",
 				notify: func() {
-					syncer.newHeads.Send(newHead2)
+					syncer.newHeads.Send(newHead2WithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1577,7 +1651,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on new pre_confirmed full of preconfirmed",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedFull)
+					syncer.preConfirmed.Send(b2PreConfirmedFullWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(senderTransactions, TxnStatusWithoutL1(TxnStatusPreConfirmed)),
@@ -1586,7 +1660,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "pre_confirmed becomes new head",
 				notify: func() {
-					syncer.newHeads.Send(newHead2)
+					syncer.newHeads.Send(newHead2WithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(senderTransactions, TxnStatusWithoutL1(TxnAcceptedOnL2)),
@@ -1607,7 +1681,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on pre_confirmed block",
 				notify: func() {
-					syncer.preConfirmed.Send(&b1PreConfirmedPartial)
+					syncer.preConfirmed.Send(b1PreConfirmedPartialWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1619,7 +1693,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "on pre_confirmed block update, without duplicates",
 				notify: func() {
-					syncer.preConfirmed.Send(&b1PreConfirmedExtended)
+					syncer.preConfirmed.Send(b1PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1631,7 +1705,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "new pre_confirmed block",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedPartial)
+					syncer.preConfirmed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1643,7 +1717,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "pre_confirmed becomes head",
 				notify: func() {
-					syncer.newHeads.Send(newHead1)
+					syncer.newHeads.Send(newHead1WithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1655,7 +1729,7 @@ func TestSubscribeNewTransactions(t *testing.T) {
 			{
 				description: "pre_confirmed update - without duplicates",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedExtended)
+					syncer.preConfirmed.Send(b2PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]*SubscriptionNewTransaction{
 					toTransactionsWithFinalityStatus(
@@ -1726,13 +1800,12 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 
 	n := &networks.Sepolia
 	client := feeder.NewTestClient(t, n)
-	gw := adaptfeeder.New(client)
 
-	newHead1, err := gw.BlockByNumber(t.Context(), 56377)
-	require.NoError(t, err)
+	newHead1 := adaptfeedertest.Block(t, client, 56377)
+	newHead1WithBloom := newBlockWithBloom(newHead1)
 
-	newHead2, err := gw.BlockByNumber(t.Context(), 56378)
-	require.NoError(t, err)
+	newHead2 := adaptfeedertest.Block(t, client, 56378)
+	newHead2WithBloom := newBlockWithBloom(newHead2)
 
 	type stepInfo struct {
 		description string
@@ -1774,11 +1847,16 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 	partialPreConfirmedCount := 3
 	extendedPreConfirmedCount := 6
 	b1PreConfirmedPartial := createTestPreConfirmed(t, newHead1, partialPreConfirmedCount)
+	b1PreConfirmedPartialWithBloom := newPreConfirmedWithBloom(&b1PreConfirmedPartial)
 	b1PreConfirmedExtended := createTestPreConfirmed(t, newHead1, extendedPreConfirmedCount)
+	b1PreConfirmedExtendedWithBloom := newPreConfirmedWithBloom(&b1PreConfirmedExtended)
 
 	b2PreConfirmedPartial := createTestPreConfirmed(t, newHead2, partialPreConfirmedCount)
+	b2PreConfirmedPartialWithBloom := newPreConfirmedWithBloom(&b2PreConfirmedPartial)
 	b2PreConfirmedExtended := createTestPreConfirmed(t, newHead2, extendedPreConfirmedCount)
+	b2PreConfirmedExtendedWithBloom := newPreConfirmedWithBloom(&b2PreConfirmedExtended)
 	b2PreConfirmedFull := createTestPreConfirmed(t, newHead2, len(newHead2.Transactions))
+	b2PreConfirmedFullWithBloom := newPreConfirmedWithBloom(&b2PreConfirmedFull)
 
 	defaultFinalityStatus := testCase{
 		description: "Basic subscription with default finality status",
@@ -1787,7 +1865,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on new head",
 				notify: func() {
-					syncer.newHeads.Send(newHead1)
+					syncer.newHeads.Send(newHead1WithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(newHead1, nil, TxnAcceptedOnL2),
@@ -1796,14 +1874,14 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on pre_confirmed",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedPartial)
+					syncer.preConfirmed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{},
 			},
 			{
 				description: "on next head",
 				notify: func() {
-					syncer.newHeads.Send(newHead2)
+					syncer.newHeads.Send(newHead2WithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(newHead2, nil, TxnAcceptedOnL2),
@@ -1819,14 +1897,14 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on new head, no response",
 				notify: func() {
-					syncer.newHeads.Send(newHead1)
+					syncer.newHeads.Send(newHead1WithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{},
 			},
 			{
 				description: "on pre_confirmed",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedPartial)
+					syncer.preConfirmed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -1839,7 +1917,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on pre_confirmed update, without duplicates",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedExtended)
+					syncer.preConfirmed.Send(b2PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -1852,7 +1930,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on next head, no response",
 				notify: func() {
-					syncer.newHeads.Send(newHead2)
+					syncer.newHeads.Send(newHead2WithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{},
 			},
@@ -1869,7 +1947,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on new head",
 				notify: func() {
-					syncer.newHeads.Send(newHead1)
+					syncer.newHeads.Send(newHead1WithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(newHead1, nil, TxnAcceptedOnL2),
@@ -1878,7 +1956,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on pre_confirmed",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedPartial)
+					syncer.preConfirmed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -1891,7 +1969,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on pre_confirmed update, without duplicates",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedExtended)
+					syncer.preConfirmed.Send(b2PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -1904,7 +1982,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on next head",
 				notify: func() {
-					syncer.newHeads.Send(newHead2)
+					syncer.newHeads.Send(newHead2WithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(newHead2, nil, TxnAcceptedOnL2),
@@ -1932,7 +2010,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on pre_confirmed",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedPartial)
+					syncer.preConfirmed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					b2PreConfirmedPartialFilteredReceipts,
@@ -1941,7 +2019,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on pre_confirmed update, without duplicates",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedFull)
+					syncer.preConfirmed.Send(b2PreConfirmedFullWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -1954,7 +2032,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on next head",
 				notify: func() {
-					syncer.newHeads.Send(newHead2)
+					syncer.newHeads.Send(newHead2WithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -1977,7 +2055,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on pre_confirmed block",
 				notify: func() {
-					syncer.preConfirmed.Send(&b1PreConfirmedPartial)
+					syncer.preConfirmed.Send(b1PreConfirmedPartialWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -1990,7 +2068,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "on pre_confirmed block update, without duplicates",
 				notify: func() {
-					syncer.preConfirmed.Send(&b1PreConfirmedExtended)
+					syncer.preConfirmed.Send(b1PreConfirmedExtendedWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -2003,7 +2081,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "new pre_confirmed block",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedPartial)
+					syncer.preConfirmed.Send(b2PreConfirmedPartialWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -2016,7 +2094,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "pre_confirmed becomes head",
 				notify: func() {
-					syncer.newHeads.Send(newHead1)
+					syncer.newHeads.Send(newHead1WithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -2029,7 +2107,7 @@ func TestSubscribeTransactionReceipts(t *testing.T) {
 			{
 				description: "pre_confirmed update - without duplicates",
 				notify: func() {
-					syncer.preConfirmed.Send(&b2PreConfirmedFull)
+					syncer.preConfirmed.Send(b2PreConfirmedFullWithBloom)
 				},
 				expect: [][]TransactionReceiptWithBlockInfo{
 					toAdaptedReceiptsWithFilter(
@@ -2214,10 +2292,8 @@ func testHeadBlock(t *testing.T) *core.Block {
 
 	n := new(networks.Sepolia)
 	client := feeder.NewTestClient(t, n)
-	gw := adaptfeeder.New(client)
 
-	b1, err := gw.BlockByNumber(t.Context(), 56377)
-	require.NoError(t, err)
+	b1 := adaptfeedertest.Block(t, client, 56377)
 
 	return b1
 }
@@ -2239,7 +2315,7 @@ func setupRPC(t *testing.T, ctx context.Context, chain blockchain.Reader, syncer
 	}()
 	time.Sleep(50 * time.Millisecond)
 
-	server := jsonrpc.NewServer(1, logger)
+	server := jsonrpc.NewServer(pool.New().WithMaxGoroutines(1), logger)
 	methods, _ := handler.methods()
 	require.NoError(t, server.RegisterMethods(methods...))
 
@@ -2378,7 +2454,6 @@ func createTestPreConfirmed(
 
 	preConfirmedBlock.Transactions = b.Transactions[:preConfirmedCount]
 	preConfirmedBlock.Receipts = b.Receipts[:preConfirmedCount]
-	preConfirmedBlock.EventsBloom = core.EventsBloom(preConfirmedBlock.Receipts)
 	preConfirmed.Block = &preConfirmedBlock
 	return preConfirmed
 }
@@ -2501,4 +2576,16 @@ func createTestWebsocket(t *testing.T, subscribe func(context.Context) (Subscrip
 	})
 
 	return id, clientConn
+}
+
+// newBlockWithBloom wraps a block with its event bloom filter for feed tests.
+func newBlockWithBloom(block *core.Block) *core.WithBloom[*core.Block] {
+	return &core.WithBloom[*core.Block]{Value: block, Bloom: core.EventsBloom(block.Receipts)}
+}
+
+func newPreConfirmedWithBloom(
+	preConfirmed *pending.PreConfirmed,
+) *core.WithBloom[*pending.PreConfirmed] {
+	withBloom := pending.NewPreConfirmedWithBloom(preConfirmed)
+	return &withBloom
 }

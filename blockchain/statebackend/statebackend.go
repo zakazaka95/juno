@@ -4,8 +4,11 @@ import (
 	"github.com/NethermindEth/juno/core"
 	"github.com/NethermindEth/juno/core/felt"
 	"github.com/NethermindEth/juno/core/state"
+	"github.com/NethermindEth/juno/core/trie2/triedb"
 	"github.com/NethermindEth/juno/db"
+	"github.com/NethermindEth/juno/db/memory"
 	"github.com/NethermindEth/juno/pruner"
+	"github.com/bits-and-blooms/bloom/v3"
 )
 
 type stateBackend struct {
@@ -54,7 +57,8 @@ func (b *stateBackend) StateAtBlockHash(
 	blockHash *felt.Felt,
 ) (core.StateReader, StateCloser, error) {
 	if blockHash.IsZero() {
-		st, err := state.NewStateReader(&felt.Zero, b.stateDB)
+		memDB := memory.New()
+		st, err := state.NewStateReader(&felt.Zero, state.NewStateDB(memDB, triedb.New(memDB, nil)))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -77,11 +81,31 @@ func (b *stateBackend) StateAtBlockHash(
 	return &history, NoopStateCloser, nil
 }
 
+func (b *stateBackend) TrieStateAtBlockNumber(
+	blockNumber uint64,
+) (core.StateReader, StateCloser, error) {
+	stateRoot, err := pruner.StateRootIfStateRetainedByBlockNumber(
+		b.database,
+		b.retentionFloor,
+		blockNumber,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	st, err := state.NewStateReader(stateRoot, b.stateDB)
+	if err != nil {
+		return nil, nil, err
+	}
+	return st, NoopStateCloser, nil
+}
+
 func (b *stateBackend) Store(
 	block *core.Block,
 	blockCommitments *core.BlockCommitments,
 	stateUpdate *core.StateUpdate,
 	newClasses map[felt.Felt]core.ClassDefinition,
+	eventsBloom *bloom.BloomFilter,
 ) error {
 	return b.database.Write(func(batch db.Batch) error {
 		if err := verifyBlockSuccession(b.database, block); err != nil {
@@ -108,7 +132,7 @@ func (b *stateBackend) Store(
 			return err
 		}
 
-		return b.runningFilter.InsertWithBatch(batch, block.EventsBloom, block.Number)
+		return b.runningFilter.InsertWithBatch(batch, eventsBloom, block.Number)
 	})
 }
 
@@ -210,6 +234,7 @@ func (b *stateBackend) Finalise(
 	stateUpdate *core.StateUpdate,
 	newClasses map[felt.Felt]core.ClassDefinition,
 	sign core.BlockSignFunc,
+	eventsBloom *bloom.BloomFilter,
 ) error {
 	return b.database.Write(func(batch db.Batch) error {
 		st, err := state.New(stateUpdate.OldRoot, b.stateDB, batch)
@@ -245,7 +270,7 @@ func (b *stateBackend) Finalise(
 			return err
 		}
 
-		return b.runningFilter.InsertWithBatch(batch, block.EventsBloom, block.Number)
+		return b.runningFilter.InsertWithBatch(batch, eventsBloom, block.Number)
 	})
 }
 

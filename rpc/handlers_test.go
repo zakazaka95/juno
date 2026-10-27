@@ -16,6 +16,7 @@ import (
 	rpcv8 "github.com/NethermindEth/juno/rpc/v8"
 	rpcv9 "github.com/NethermindEth/juno/rpc/v9"
 	"github.com/NethermindEth/juno/sync"
+	"github.com/NethermindEth/juno/sync/preconfirmed"
 	"github.com/NethermindEth/juno/utils/log"
 	"github.com/go-playground/validator/v10"
 	"github.com/stretchr/testify/assert"
@@ -38,9 +39,9 @@ func TestRun(t *testing.T) {
 	t.Cleanup(mockCtrl.Finish)
 
 	l1Sub := feed.New[*core.L1Head]()
-	newHeadsSub := feed.New[*core.Block]()
+	newHeadsSub := feed.New[*core.WithBloom[*core.Block]]()
 	reorgSub := feed.New[*sync.ReorgBlockRange]()
-	preConfirmedSub := feed.New[*pending.PreConfirmed]()
+	preConfirmedSub := feed.New[*core.WithBloom[*pending.PreConfirmed]]()
 
 	mockBcReader := mocks.NewMockReader(mockCtrl)
 	mockSyncReader := mocks.NewMockSyncReader(mockCtrl)
@@ -54,7 +55,7 @@ func TestRun(t *testing.T) {
 		sync.ReorgSubscription{Subscription: reorgSub.Subscribe()},
 	).AnyTimes()
 	mockSyncReader.EXPECT().SubscribePreConfirmed().Return(
-		sync.PreConfirmedDataSubscription{Subscription: preConfirmedSub.Subscribe()},
+		preconfirmed.Subscription{Subscription: preConfirmedSub.Subscribe()},
 	).AnyTimes()
 
 	handler := &Handler{
