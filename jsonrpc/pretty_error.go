@@ -93,6 +93,9 @@ func countRuneStarts(p []byte) int {
 
 func countRuneStartsInWord(word uint64) int {
 	const highBits = uint64(0x8080808080808080)
+	if word&highBits == 0 {
+		return 8
+	}
 	// UTF-8 continuation bytes start with 10; isolate their high bits and
 	// subtract them from the eight possible rune starts in the word.
 	continuationBits := word & ^(word << 1) & highBits
