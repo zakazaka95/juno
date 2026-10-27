@@ -254,7 +254,7 @@ func TestHandleParseErrorChunked(t *testing.T) {
 
 		"discarded newline resets the absolute column prefix": {
 			req: strings.Repeat(" ", 600) + "\n" + `{"padding":"` + strings.Repeat("👍", 160) + `","id":@` + strings.Repeat("x", 96) + `}`,
-			res: `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"...👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍\",\"id\":@xxxxxxxxx\n                                                                   ^\nunexpected '@', expected a value [line 2, position 180]"},"id":null}`,
+			res: `{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error","data":"...👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍\",\"id\":@xxxxxxxxxx\n                                                                  ^\nunexpected '@', expected a value [line 2, position 180]"},"id":null}`,
 		},
 	}
 
