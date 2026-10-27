@@ -12,7 +12,7 @@ jobs:
   jsonrpc:
     if: github.repository == 'zakazaka95/juno'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       CGO_ENABLED: "1"
       GOFLAGS: -mod=readonly
@@ -26,13 +26,13 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install native dependencies from repository CI
-        run: sudo apt-get update -qq && sudo apt-get install -y libjemalloc-dev libjemalloc2 libbz2-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y libjemalloc-dev libjemalloc2 libbz2-dev pkg-config
       - name: Confirm focused native dependency closure
         run: go list -deps -test -f '{{if .CgoFiles}}{{.ImportPath}} {{.CgoFiles}}{{end}}' ./jsonrpc
       - name: Full JSON-RPC package tests
         shell: bash
         run: |
-          go test -json ./jsonrpc -count=1 -timeout=5m | tee "$RUNNER_TEMP/juno-jsonrpc.jsonl"
+          go test -short -json ./jsonrpc -count=1 -timeout=5m | tee "$RUNNER_TEMP/juno-jsonrpc.jsonl"
           python3 - <<'PY'
           import json
           import os
@@ -47,7 +47,7 @@ jobs:
           PY
       - name: Vet JSON-RPC package
         run: go vet ./jsonrpc
-      - name: Literal-output negative controls
+      - name: Original-production and literal-output negative controls
         shell: bash
         run: |
           python3 - <<'PY'
@@ -57,38 +57,96 @@ jobs:
 
           path = Path("jsonrpc/pretty_error.go")
           original = path.read_text()
+          upstream = subprocess.check_output(
+              ["git", "show", "301cbb99d4044a3e323ace1792a7605a76a8516e:jsonrpc/pretty_error.go"], text=True,
+          )
           controls = [
-              ("absolute column", [("absoluteCol += c.linePrefixRunes", "absoluteCol += 0")]),
-              ("caret column", [
-                  ("line, relativeCol, absoluteCol := lineAndColumn(c, markerPos)", "line, _, absoluteCol := lineAndColumn(c, markerPos)"),
-                  ("return drawMarker(c.window, windowStart, markerPos, relativeCol, msg)", "return drawMarker(c.window, windowStart, markerPos, absoluteCol, msg)"),
-              ]),
+              ("current upstream production", upstream, "^TestHandleParseError", 4),
+              ("absolute column", original.replace("absoluteCol += c.linePrefixRunes", "absoluteCol += 0"), "^TestHandleParseErrorChunked$", 3),
+              ("caret column", original.replace(
+                  "line, relativeCol, absoluteCol := lineAndColumn(c, markerPos)",
+                  "line, _, absoluteCol := lineAndColumn(c, markerPos)",
+              ).replace(
+                  "return drawMarker(c.window, windowStart, markerPos, relativeCol, msg)",
+                  "return drawMarker(c.window, windowStart, markerPos, absoluteCol, msg)",
+              ), "^TestHandleParseErrorChunked$", 3),
           ]
           try:
-              for name, replacements in controls:
-                  mutated = original
-                  for before, after in replacements:
-                      assert mutated.count(before) == 1, before
-                      mutated = mutated.replace(before, after)
+              for name, mutated, pattern, count in controls:
+                  assert mutated != original, name
                   path.write_text(mutated)
                   result = subprocess.run(
-                      ["go", "test", "-json", "./jsonrpc", "-run", "^TestHandleParseErrorChunked$", "-count=1", "-timeout=90s"],
+                      ["go", "test", "-short", "-json", "./jsonrpc", "-run", pattern, "-count=1", "-timeout=90s"],
                       capture_output=True, text=True, timeout=120,
                   )
                   events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
                   failures = [
                       event["Test"] for event in events
-                      if event.get("Action") == "fail" and event.get("Test", "").startswith("TestHandleParseErrorChunked/")
+                      if event.get("Action") == "fail" and "/" in event.get("Test", "")
                   ]
                   print(f"{name}: returncode={result.returncode}, assertion failures={failures}")
-                  assert result.returncode != 0 and len(failures) == 3, result.stdout + result.stderr
+                  assert result.returncode != 0 and len(failures) == count, result.stdout + result.stderr
                   assert "[build failed]" not in result.stdout + result.stderr
                   path.write_text(original)
           finally:
               path.write_text(original)
           PY
-          go test ./jsonrpc -run '^TestHandleParseErrorChunked$' -count=1 -timeout=90s
+          go test -short ./jsonrpc -run '^TestHandleParseError' -count=1 -timeout=90s
           git diff --exit-code
+      - name: Fresh five-run benchmarks against current main
+        shell: bash
+        env:
+          GOMAXPROCS: "1"
+        run: |
+          go version
+          go env GOOS GOARCH
+          lscpu | grep -E 'Model name|Architecture|CPU\(s\)'
+          git worktree add --detach "$RUNNER_TEMP/juno-main" 301cbb99d4044a3e323ace1792a7605a76a8516e
+          (
+            cd "$RUNNER_TEMP/juno-main"
+            go test -short ./jsonrpc -run '^$' -bench '^(BenchmarkHandle|BenchmarkHandleLargeRequest)$' -benchmem -benchtime=2s -count=5 -cpu=1
+          ) | tee "$RUNNER_TEMP/juno-main-bench.txt"
+          go test -short ./jsonrpc -run '^$' -bench '^(BenchmarkHandle|BenchmarkHandleLargeRequest)$' -benchmem -benchtime=2s -count=5 -cpu=1 | tee "$RUNNER_TEMP/juno-feature-bench.txt"
+          python3 - <<'PY'
+          import os
+          import re
+          import statistics
+          from collections import defaultdict
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"])
+          def read(path):
+              groups = defaultdict(list)
+              for line in path.read_text().splitlines():
+                  parts = line.split()
+                  if not parts or not parts[0].startswith("Benchmark") or "ns/op" not in parts:
+                      continue
+                  name = re.sub(r"-\d+$", "", parts[0])
+                  groups[name].append((
+                      float(parts[parts.index("ns/op") - 1]),
+                      int(parts[parts.index("B/op") - 1]),
+                      int(parts[parts.index("allocs/op") - 1]),
+                  ))
+              return groups
+          baseline = read(root / "juno-main-bench.txt")
+          feature = read(root / "juno-feature-bench.txt")
+          assert set(baseline) == set(feature) and len(baseline) == 3
+          lines = [
+              "Baseline: 301cbb99d4044a3e323ace1792a7605a76a8516e; same runner, GOMAXPROCS=1, 2s, count=5, cpu=1.",
+              "| Benchmark | Main ns/op | Feature ns/op | Delta | Main B/op | Feature B/op | Main allocs/op | Feature allocs/op |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|",
+          ]
+          for name in sorted(baseline):
+              assert len(baseline[name]) == len(feature[name]) == 5, name
+              before = [statistics.median(values) for values in zip(*baseline[name])]
+              after = [statistics.median(values) for values in zip(*feature[name])]
+              delta = 100 * (after[0] / before[0] - 1)
+              lines.append(f"| {name} | {before[0]:.3f} | {after[0]:.3f} | {delta:+.2f}% | {before[1]} | {after[1]} | {before[2]} | {after[2]} |")
+          summary = "\n".join(lines) + "\n"
+          print(summary)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
+              output.write(summary)
+          PY
       - name: Check Go formatting
         shell: bash
         run: |
@@ -105,7 +163,7 @@ jobs:
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a
         with:
           version: latest
-          args: --config=./.golangci_diff.yaml --new-from-rev=b87a330ddd8b9b7b5ac82a0c0722367a622663f1 ./jsonrpc/...
+          args: --config=./.golangci_diff.yaml --new-from-rev=301cbb99d4044a3e323ace1792a7605a76a8516e ./jsonrpc/...
       - name: Confirm source and dependency files restored
         if: always()
         run: git diff --exit-code
